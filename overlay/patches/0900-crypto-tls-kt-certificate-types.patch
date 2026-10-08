@@ -1,0 +1,830 @@
+crypto/tls: send one CertificateRequest certificate type per suite
+
+A TLS 1.2 server sends the certificate_types rsa_sign and ecdsa_sign in
+its CertificateRequest, whatever the cipher suite. gemSpec_Krypt
+A_22454 requires an eHealth card terminal to send exactly one type:
+ecdsa_sign on ECDHE_ECDSA suites, rsa_sign on RSA suites. A Go client
+then picks the client certificate that matches the suite.
+
+This refuses RSA client certificates on ECDSA suites (and the reverse)
+for clients that follow certificate_types, which TLS 1.2 allows. It is
+for the overlay profile of eHealth card terminals only and is not meant
+for upstream.
+
+The TLS 1.2 TestClientAuth recordings were regenerated with OpenSSL
+1.1.1w (as handshake_test.go requires); the RSA client certificate cases
+and TestPKCS1OnlyCert now use a server with an RSA certificate, so that
+the suite asks for RSA certificates.
+
+ivory: P6, profile kt only. Base: go1.27.2 with P0-P5.
+Requirement: A_22454 (gemSpec_Krypt V2.51.0). Upstream: never.
+Probe: K3.
+
+diff --git a/src/crypto/tls/certificate_types_test.go b/src/crypto/tls/certificate_types_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/tls/certificate_types_test.go
+@@ -0,0 +1,91 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"bytes"
++	"net"
++	"sync"
++	"testing"
++)
++
++// certificateRequestRecorder is a net.Conn that records the
++// certificate_types of the TLS 1.2 CertificateRequest it writes.
++type certificateRequestRecorder struct {
++	net.Conn
++	mu        sync.Mutex
++	certTypes []byte
++}
++
++func (c *certificateRequestRecorder) Write(b []byte) (int, error) {
++	for rec := b; len(rec) > recordHeaderLen; {
++		n := recordHeaderLen + (int(rec[3])<<8 | int(rec[4]))
++		if n > len(rec) {
++			break
++		}
++		if recordType(rec[0]) == recordTypeHandshake && rec[recordHeaderLen] == typeCertificateRequest {
++			body := rec[recordHeaderLen+4 : n]
++			c.mu.Lock()
++			c.certTypes = bytes.Clone(body[1 : 1+int(body[0])])
++			c.mu.Unlock()
++		}
++		rec = rec[n:]
++	}
++	return c.Conn.Write(b)
++}
++
++// TestCertificateRequestTypes checks that a TLS 1.2 server asks for exactly
++// one client certificate type, the one that matches the cipher suite
++// (gemSpec_Krypt A_22454), and that a client with both certificate types
++// sends the matching one.
++func TestCertificateRequestTypes(t *testing.T) {
++	for _, tt := range []struct {
++		name      string
++		suite     uint16
++		cert      Certificate
++		wantTypes []byte
++		wantLeaf  Certificate
++	}{
++		{"ECDHE_ECDSA", TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, testECDSAP256Cert, []byte{certTypeECDSASign}, testClientECDSAP256Cert},
++		{"ECDHE_RSA", TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, testRSA2048Cert, []byte{certTypeRSASign}, testClientRSA2048Cert},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			serverConfig := testConfigServer.Clone()
++			serverConfig.MaxVersion = VersionTLS12
++			serverConfig.Certificates = []Certificate{tt.cert}
++			serverConfig.ClientAuth = RequireAnyClientCert
++			clientConfig := testConfigClient.Clone()
++			clientConfig.CipherSuites = []uint16{tt.suite}
++			clientConfig.Certificates = []Certificate{testClientRSA2048Cert, testClientECDSAP256Cert}
++
++			c, s := localPipe(t)
++			rec := &certificateRequestRecorder{Conn: s}
++			done := make(chan error, 1)
++			var peer []byte
++			go func() {
++				srv := Server(rec, serverConfig)
++				err := srv.Handshake()
++				if err == nil {
++					peer = srv.ConnectionState().PeerCertificates[0].Raw
++				}
++				s.Close()
++				done <- err
++			}()
++			clientErr := Client(c, clientConfig).Handshake()
++			c.Close()
++			if serverErr := <-done; clientErr != nil || serverErr != nil {
++				t.Fatalf("client: %v, server: %v", clientErr, serverErr)
++			}
++			rec.mu.Lock()
++			defer rec.mu.Unlock()
++			if !bytes.Equal(rec.certTypes, tt.wantTypes) {
++				t.Errorf("certificate_types = %x, want %x", rec.certTypes, tt.wantTypes)
++			}
++			if !bytes.Equal(peer, tt.wantLeaf.Certificate[0]) {
++				t.Error("client sent the certificate of the other type")
++			}
++		})
++	}
++}
+diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_server.go
+--- a/src/crypto/tls/handshake_server.go
++++ b/src/crypto/tls/handshake_server.go
+@@ -663,9 +663,13 @@ func (hs *serverHandshakeState) doFullHandshake() error {
+ 	if c.config.ClientAuth >= RequestClientCert {
+ 		// Request a client certificate
+ 		certReq = new(certificateRequestMsg)
+-		certReq.certificateTypes = []byte{
+-			byte(certTypeRSASign),
+-			byte(certTypeECDSASign),
++		// Send exactly one certificate type, the one that matches the
++		// cipher suite, as gemSpec_Krypt A_22454 requires of an
++		// eHealth-KT. TLS 1.2 allows both on every suite.
++		if hs.suite.flags&suiteECSign != 0 {
++			certReq.certificateTypes = []byte{byte(certTypeECDSASign)}
++		} else {
++			certReq.certificateTypes = []byte{byte(certTypeRSASign)}
+ 		}
+ 		if c.vers >= VersionTLS12 {
+ 			certReq.hasSignatureAlgorithm = true
+diff --git a/src/crypto/tls/handshake_server_test.go b/src/crypto/tls/handshake_server_test.go
+--- a/src/crypto/tls/handshake_server_test.go
++++ b/src/crypto/tls/handshake_server_test.go
+@@ -1582,13 +1582,20 @@ func TestClientAuth(t *testing.T) {
+ 	runServerTestTLS12(t, test)
+ 	runServerTestTLS13(t, test)
+ 
++	// In TLS 1.2, the server asks only for client certificates whose type
++	// matches the cipher suite (gemSpec_Krypt A_22454), so an RSA client
++	// certificate needs an ECDHE_RSA suite.
++	rsaConfig := config.Clone()
++	rsaConfig.Certificates = []Certificate{testRSA2048Cert}
++
+ 	test = &serverTest{
+ 		name:              "ClientAuthRequestedAndGiven",
+ 		command:           append(defaultClientCommand, "-cert", certPath, "-key", keyPath, "-client_sigalgs", "rsa_pss_rsae_sha256"),
+-		config:            config,
++		config:            rsaConfig,
+ 		expectedPeerCerts: []string{testClientRSA2048CertPEM},
+ 	}
+ 	runServerTestTLS12(t, test)
++	test.config = config
+ 	runServerTestTLS13(t, test)
+ 
+ 	test = &serverTest{
+@@ -1612,7 +1619,7 @@ func TestClientAuth(t *testing.T) {
+ 	test = &serverTest{
+ 		name:              "ClientAuthRequestedAndPKCS1v15Given",
+ 		command:           append(defaultClientCommand, "-cert", certPath, "-key", keyPath, "-client_sigalgs", "rsa_pkcs1_sha256"),
+-		config:            config,
++		config:            rsaConfig,
+ 		expectedPeerCerts: []string{testClientRSA2048CertPEM},
+ 	}
+ 	runServerTestTLS12(t, test)
+diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGiven b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGiven
+--- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGiven
++++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGiven
+@@ -1,7 +1,7 @@
+ >>> Flow 1 (client to server)
+-00000000  16 03 01 00 d5 01 00 00  d1 03 03 91 05 3d 04 e9  |.............=..|
+-00000010  6b 4b 94 88 f5 5c 9c 50  ee 76 d2 7c 81 1f 47 f4  |kK...\.P.v.|..G.|
+-00000020  25 a7 7e b1 dc 0d 77 e2  d3 d6 e5 00 00 38 c0 2c  |%.~...w......8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 d9 b1 a3 5b bc  |..............[.|
++00000010  7f 1d 91 e0 2e 4e 6f e9  89 03 9c a9 ba 83 31 ce  |.....No.......1.|
++00000020  0c a6 38 fd 12 a8 b9 ac  d5 b5 e8 00 00 38 c0 2c  |..8..........8.,|
+ 00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
+ 00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
+ 00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
+@@ -56,15 +56,15 @@
+ 00000270  b2 6f 7a a1 46 b0 dd 56  7c a0 ef 4b c0 00 60 65  |.oz.F..V|..K..`e|
+ 00000280  11 6e d0 e0 77 47 77 f2  d7 9c 04 45 bb 82 eb 4e  |.n..wGw....E...N|
+ 00000290  f5 da 16 43 4d 45 c7 c7  e4 9b 08 2e d4 b4 6b 1f  |...CME........k.|
+-000002a0  df ed 16 03 03 00 72 0c  00 00 6e 03 00 1d 20 bb  |......r...n... .|
++000002a0  df ed 16 03 03 00 73 0c  00 00 6f 03 00 1d 20 bb  |......s...o... .|
+ 000002b0  af fa db e3 de 3a 65 10  e8 9b 4b be c7 04 31 92  |.....:e...K...1.|
+ 000002c0  72 a2 39 97 24 0b 71 bb  86 4f f4 cb 98 39 57 04  |r.9.$.q..O...9W.|
+-000002d0  03 00 46 30 44 02 20 34  8d 00 09 fe c0 a1 36 6e  |..F0D. 4......6n|
+-000002e0  54 44 74 86 32 20 70 1a  ac d3 c1 67 90 92 a3 e0  |TDt.2 p....g....|
+-000002f0  24 9a b2 73 8b d9 aa 02  20 11 3f 09 d0 2f 0f a1  |$..s.... .?../..|
+-00000300  fc 8d 80 c2 52 22 a8 b9  ff d2 ef 32 1f e9 0f d0  |....R".....2....|
+-00000310  79 25 99 69 8e c6 28 2b  cf 16 03 03 00 39 0d 00  |y%.i..(+.....9..|
+-00000320  00 35 02 01 40 00 14 08  04 04 03 08 07 08 05 08  |.5..@...........|
++000002d0  03 00 47 30 45 02 21 00  e8 a1 ac a2 5b 7a db 49  |..G0E.!.....[z.I|
++000002e0  ed 62 29 1f 32 25 20 07  ca 80 34 9e 59 a3 b4 7c  |.b).2% ...4.Y..||
++000002f0  ec 3b 93 76 85 f1 d9 42  02 20 04 b9 81 0c 55 5c  |.;.v...B. ....U\|
++00000300  96 f4 2b 72 80 ea ca 7f  64 63 26 af b6 4a 6b 21  |..+r....dc&..Jk!|
++00000310  bf 0e e0 11 74 aa 6a 81  6b 41 16 03 03 00 38 0d  |....t.j.kA....8.|
++00000320  00 00 34 01 40 00 14 08  04 04 03 08 07 08 05 08  |..4.@...........|
+ 00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
+ 00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
+ 00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
+@@ -108,22 +108,22 @@
+ 00000240  3e 33 20 6d 15 44 4a d8  ae bb e4 8a cd ea 9b b0  |>3 m.DJ.........|
+ 00000250  1f 1a 10 43 ad 0d 07 85  bb 41 6b 35 7f 2b 41 d1  |...C.....Ak5.+A.|
+ 00000260  53 b1 c4 16 77 6b ec 9f  1e e4 14 b1 7c 54 76 e8  |S...wk......|Tv.|
+-00000270  16 03 03 00 25 10 00 00  21 20 c2 c0 5a 10 24 c0  |....%...! ..Z.$.|
+-00000280  0d 6e 81 0d 76 29 c6 9c  95 28 06 9a 18 6a c0 58  |.n..v)...(...j.X|
+-00000290  eb 65 ba da 4e 9a 5c 88  91 7b 16 03 03 00 50 0f  |.e..N.\..{....P.|
+-000002a0  00 00 4c 04 03 00 48 30  46 02 21 00 af f2 96 a0  |..L...H0F.!.....|
+-000002b0  6a 75 9a 58 b3 25 71 df  38 92 58 b7 79 a6 55 36  |ju.X.%q.8.X.y.U6|
+-000002c0  5b 06 3f 6b 75 03 82 33  0e 27 34 89 02 21 00 b4  |[.?ku..3.'4..!..|
+-000002d0  e7 7a 7b 78 3d 44 d1 7d  35 6b fc 0e 32 0b d2 90  |.z{x=D.}5k..2...|
+-000002e0  74 00 8e 66 82 4b db ee  af 39 bc 3d d0 4d a2 14  |t..f.K...9.=.M..|
+-000002f0  03 03 00 01 01 16 03 03  00 20 c4 de b9 a7 0e 5d  |......... .....]|
+-00000300  b0 94 18 6e 0b 59 4a 72  bb 03 7b 32 c3 94 c8 e4  |...n.YJr..{2....|
+-00000310  ef 1e ea 24 95 41 97 7c  42 ed                    |...$.A.|B.|
++00000270  16 03 03 00 25 10 00 00  21 20 03 dd 3f 8a 47 92  |....%...! ..?.G.|
++00000280  a0 c4 3b 1e 3a 6a b8 78  4e 64 76 66 4d 33 d3 80  |..;.:j.xNdvfM3..|
++00000290  d6 81 17 2b 3f 15 00 35  cd 5c 16 03 03 00 4f 0f  |...+?..5.\....O.|
++000002a0  00 00 4b 04 03 00 47 30  45 02 21 00 c5 a1 94 50  |..K...G0E.!....P|
++000002b0  5e 77 f3 df bf d5 af a3  8a 52 34 74 ad c5 30 35  |^w.......R4t..05|
++000002c0  cf 45 8d c2 91 a9 c0 71  b2 b0 f1 1f 02 20 71 50  |.E.....q..... qP|
++000002d0  6c a9 24 aa 82 1c b5 88  f2 76 df e0 02 17 56 d7  |l.$......v....V.|
++000002e0  14 22 5c 2d 42 63 ce bb  d2 0f 94 d5 64 fb 14 03  |."\-Bc......d...|
++000002f0  03 00 01 01 16 03 03 00  20 82 2e 15 ae 8d 4b f2  |........ .....K.|
++00000300  5a e2 60 d7 7b df aa cb  cf f8 a8 46 08 08 05 31  |Z.`.{......F...1|
++00000310  ae f8 07 5e 6f ff 63 e9  75                       |...^o.c.u|
+ >>> Flow 4 (server to client)
+-00000000  14 03 03 00 01 01 16 03  03 00 20 55 30 1e a5 e0  |.......... U0...|
+-00000010  6b 2f 60 6e 4a d0 24 ad  33 a8 93 1d 84 c9 83 4d  |k/`nJ.$.3......M|
+-00000020  d2 ae 58 70 f0 fd a5 3c  01 74 1a 17 03 03 00 1d  |..Xp...<.t......|
+-00000030  37 c7 7f 78 a1 52 77 a6  cf e0 cc 30 21 0f cd 08  |7..x.Rw....0!...|
+-00000040  d2 77 d2 41 bb e3 a9 e6  bf 75 51 aa cb 15 03 03  |.w.A.....uQ.....|
+-00000050  00 12 7b 42 7c 52 40 98  61 2d 41 80 31 83 b1 05  |..{B|R@.a-A.1...|
+-00000060  5e 44 13 c1                                       |^D..|
++00000000  14 03 03 00 01 01 16 03  03 00 20 39 e9 c7 8a 29  |.......... 9...)|
++00000010  2e c4 b7 83 19 79 42 cf  5f 1a 73 d5 bc e8 58 2a  |.....yB._.s...X*|
++00000020  b4 38 e7 45 35 6a 12 7a  da b6 46 17 03 03 00 1d  |.8.E5j.z..F.....|
++00000030  18 79 8e b6 32 ad 8b 12  b4 91 fe 98 f8 24 76 9d  |.y..2........$v.|
++00000040  66 3d 62 f7 b8 c3 34 0a  6b 3e fc ec 2a 15 03 03  |f=b...4.k>..*...|
++00000050  00 12 f2 fe e4 2c 0f aa  98 a0 7b 5d 10 f6 05 2d  |.....,....{]...-|
++00000060  15 6c 4b 4f                                       |.lKO|
+diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given
+--- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given
++++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given
+@@ -1,7 +1,7 @@
+ >>> Flow 1 (client to server)
+-00000000  16 03 01 00 d5 01 00 00  d1 03 03 3c b7 90 aa bf  |...........<....|
+-00000010  bf c1 45 ce 4f dc 91 11  ef 90 a9 08 7f 3b 6d 27  |..E.O........;m'|
+-00000020  34 09 c0 76 ff 4a 37 62  ad ee 9e 00 00 38 c0 2c  |4..v.J7b.....8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 4c 07 fc 5b c0  |...........L..[.|
++00000010  f0 fc 44 8a 6f ad 19 09  d8 45 04 0e 3c 23 9e 31  |..D.o....E..<#.1|
++00000020  e8 35 68 b8 46 13 cf 1e  cb d5 87 00 00 38 c0 2c  |.5h.F........8.,|
+ 00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
+ 00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
+ 00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
+@@ -59,16 +59,15 @@
+ 000002a0  df ed 16 03 03 00 73 0c  00 00 6f 03 00 1d 20 bb  |......s...o... .|
+ 000002b0  af fa db e3 de 3a 65 10  e8 9b 4b be c7 04 31 92  |.....:e...K...1.|
+ 000002c0  72 a2 39 97 24 0b 71 bb  86 4f f4 cb 98 39 57 04  |r.9.$.q..O...9W.|
+-000002d0  03 00 47 30 45 02 21 00  ae 1d 8e 2d 2a 20 30 1d  |..G0E.!....-* 0.|
+-000002e0  22 f3 ea f5 6e 6c 8b 73  37 c8 7f 46 ec dd dc 14  |"...nl.s7..F....|
+-000002f0  9c ee 43 6e 77 a3 74 cb  02 20 43 23 ab c8 7e b8  |..Cnw.t.. C#..~.|
+-00000300  15 a6 e0 ef 6d 10 a6 1d  db 0f ab a0 ec 63 d2 40  |....m........c.@|
+-00000310  cc 1b fa ce ea 1a bb 05  58 8c 16 03 03 00 39 0d  |........X.....9.|
+-00000320  00 00 35 02 01 40 00 14  08 04 04 03 08 07 08 05  |..5..@..........|
+-00000330  08 06 04 01 05 01 06 01  05 03 06 03 00 1a 00 18  |................|
+-00000340  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
+-00000350  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
+-00000360  00                                                |.|
++000002d0  03 00 47 30 45 02 21 00  83 15 be f1 ae c8 ab 33  |..G0E.!........3|
++000002e0  e1 05 a0 e3 0e b4 d3 1e  16 85 85 90 5e bd 10 05  |............^...|
++000002f0  fc 84 1e 7e 19 21 7a ef  02 20 6c 94 e6 f5 a2 85  |...~.!z.. l.....|
++00000300  21 81 97 56 c8 65 12 82  1e 6d 4a bc 14 e0 73 f2  |!..V.e...mJ...s.|
++00000310  6e 28 96 99 77 8d 66 f2  20 4c 16 03 03 00 38 0d  |n(..w.f. L....8.|
++00000320  00 00 34 01 40 00 14 08  04 04 03 08 07 08 05 08  |..4.@...........|
++00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
++00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
++00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
+ >>> Flow 3 (client to server)
+ 00000000  16 03 03 02 38 0b 00 02  34 00 02 31 00 02 2e 30  |....8...4..1...0|
+ 00000010  82 02 2a 30 82 01 12 a0  03 02 01 02 02 01 0e 30  |..*0...........0|
+@@ -106,21 +105,21 @@
+ 00000210  39 b2 62 5e de 16 ed af  5b 96 ff 88 cc 14 f8 78  |9.b^....[......x|
+ 00000220  07 93 87 4a b1 16 27 fc  48 cf 51 a4 bb a2 e6 d2  |...J..'.H.Q.....|
+ 00000230  8c 75 51 f3 c0 6d 09 90  d5 43 2c ef 1f 16 03 03  |.uQ..m...C,.....|
+-00000240  00 25 10 00 00 21 20 5c  7c 37 15 76 b5 28 9a 97  |.%...! \|7.v.(..|
+-00000250  3a c8 1d ff aa 95 66 42  d4 f4 06 16 ff 0a 9d 75  |:.....fB.......u|
+-00000260  9f 86 d1 67 cb d1 77 16  03 03 00 48 0f 00 00 44  |...g..w....H...D|
+-00000270  08 07 00 40 91 aa 70 b9  37 b1 2e 68 5d 46 34 a3  |...@..p.7..h]F4.|
+-00000280  c8 4a 47 a4 55 25 93 99  2f 76 70 fb 8b 1e 1a 66  |.JG.U%../vp....f|
+-00000290  c3 11 5c 44 62 a3 d9 3e  72 06 55 5a 22 9b a3 cd  |..\Db..>r.UZ"...|
+-000002a0  c9 0c e1 e9 66 f3 e2 9c  2d 73 35 60 eb dc 1b f5  |....f...-s5`....|
+-000002b0  ad b9 2f 0d 14 03 03 00  01 01 16 03 03 00 20 5c  |../........... \|
+-000002c0  10 72 6b 41 77 23 bb 2b  73 4a 53 f9 85 15 3f bf  |.rkAw#.+sJS...?.|
+-000002d0  c3 51 e4 25 c3 5a 99 af  93 c1 bc d4 a2 24 ac     |.Q.%.Z.......$.|
++00000240  00 25 10 00 00 21 20 49  ae d5 26 99 54 48 22 03  |.%...! I..&.TH".|
++00000250  07 51 e9 75 04 ec 37 59  97 11 08 f0 00 49 f0 8f  |.Q.u..7Y.....I..|
++00000260  c8 ee cc 07 c3 14 6f 16  03 03 00 48 0f 00 00 44  |......o....H...D|
++00000270  08 07 00 40 42 4d 94 75  46 9d 76 e5 f8 62 62 6e  |...@BM.uF.v..bbn|
++00000280  93 5e 5f 37 44 9c 4e 31  16 d3 87 a6 e0 97 4d 73  |.^_7D.N1......Ms|
++00000290  77 ea 6d bb a4 29 d4 1b  07 ed c2 1a 21 82 44 6f  |w.m..)......!.Do|
++000002a0  5b fa a1 96 4e 43 7d 88  d3 9d 49 65 0b bc 55 c0  |[...NC}...Ie..U.|
++000002b0  4d e0 4d 03 14 03 03 00  01 01 16 03 03 00 20 2f  |M.M........... /|
++000002c0  24 81 6b 35 6d a2 0e 47  39 49 ab ed d2 86 07 3d  |$.k5m..G9I.....=|
++000002d0  d3 48 22 69 d5 76 e4 a2  f8 82 97 a5 36 ed 61     |.H"i.v......6.a|
+ >>> Flow 4 (server to client)
+-00000000  14 03 03 00 01 01 16 03  03 00 20 80 ea 96 5c 70  |.......... ...\p|
+-00000010  a1 c6 3d 12 3a 9e 53 74  2b d3 f0 8b 75 f4 fe 3a  |..=.:.St+...u..:|
+-00000020  2a f9 84 f0 f9 4d 65 f3  ef 20 59 17 03 03 00 1d  |*....Me.. Y.....|
+-00000030  d4 65 88 2f 10 f6 3b 66  4d 2b a4 f3 a7 94 dd ed  |.e./..;fM+......|
+-00000040  b3 03 54 ce 76 ec a8 9d  32 f4 40 ee 74 15 03 03  |..T.v...2.@.t...|
+-00000050  00 12 34 73 94 89 e2 ae  cf a6 4a cf 95 11 cd 33  |..4s......J....3|
+-00000060  a4 4e 66 db                                       |.Nf.|
++00000000  14 03 03 00 01 01 16 03  03 00 20 80 db 3c f7 7c  |.......... ..<.||
++00000010  f7 e9 9b 67 8f f8 64 cd  17 80 36 cf 3e 41 78 b3  |...g..d...6.>Ax.|
++00000020  34 42 68 75 39 7c 4f 89  34 6d d1 17 03 03 00 1d  |4Bhu9|O.4m......|
++00000030  f1 b8 7e 8a 3f 4d d2 6e  4a 48 f3 8b 07 c1 66 60  |..~.?M.nJH....f`|
++00000040  f2 f3 c0 4b 91 b4 74 ae  3a 21 b3 4a ee 15 03 03  |...K..t.:!.J....|
++00000050  00 12 12 01 c3 bd ed 42  d0 6c dc d4 34 3c ab e6  |.......B.l..4<..|
++00000060  14 16 f4 9c                                       |....|
+diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven
+--- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven
++++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven
+@@ -1,7 +1,7 @@
+ >>> Flow 1 (client to server)
+-00000000  16 03 01 00 d5 01 00 00  d1 03 03 80 7b d1 f7 ac  |............{...|
+-00000010  3d b0 45 32 ed 33 88 d7  6f 4c 50 aa 84 18 4f 91  |=.E2.3..oLP...O.|
+-00000020  ae ec 58 f9 2d 0d c5 0d  59 ac 82 00 00 38 c0 2c  |..X.-...Y....8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 18 d2 a3 4b 26  |..............K&|
++00000010  49 b5 e0 cf 64 34 0b ad  06 1e c5 f0 4a ac 44 fd  |I...d4......J.D.|
++00000020  35 3c b8 0c 50 75 69 ff  c0 7d b6 00 00 38 c0 2c  |5<..Pui..}...8.,|
+ 00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
+ 00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
+ 00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
+@@ -16,58 +16,83 @@
+ >>> Flow 2 (server to client)
+ 00000000  16 03 03 00 3f 02 00 00  3b 03 03 2c 84 0e c3 c0  |....?...;..,....|
+ 00000010  fd 58 12 43 ce a3 e8 28  a1 5c 70 ce 9a 7f 3b 59  |.X.C...(.\p...;Y|
+-00000020  f9 a2 aa 44 4f 57 4e 47  52 44 01 00 cc a9 00 00  |...DOWNGRD......|
++00000020  f9 a2 aa 44 4f 57 4e 47  52 44 01 00 cc a8 00 00  |...DOWNGRD......|
+ 00000030  13 ff 01 00 01 00 00 17  00 00 00 0b 00 02 01 00  |................|
+-00000040  00 00 00 00 16 03 03 02  59 0b 00 02 55 00 02 52  |........Y...U..R|
+-00000050  00 02 4f 30 82 02 4b 30  82 01 33 a0 03 02 01 02  |..O0..K0..3.....|
+-00000060  02 01 03 30 0d 06 09 2a  86 48 86 f7 0d 01 01 0b  |...0...*.H......|
++00000040  00 00 00 00 16 03 03 03  21 0b 00 03 1d 00 03 1a  |........!.......|
++00000050  00 03 17 30 82 03 13 30  82 01 fb a0 03 02 01 02  |...0...0........|
++00000060  02 01 04 30 0d 06 09 2a  86 48 86 f7 0d 01 01 0b  |...0...*.H......|
+ 00000070  05 00 30 0f 31 0d 30 0b  06 03 55 04 03 13 04 52  |..0.1.0...U....R|
+ 00000080  6f 6f 74 30 1e 17 0d 31  36 30 37 31 32 31 37 33  |oot0...160712173|
+ 00000090  32 30 39 5a 17 0d 31 37  30 31 32 38 31 37 33 32  |209Z..1701281732|
+-000000a0  30 39 5a 30 16 31 14 30  12 06 03 55 04 03 13 0b  |09Z0.1.0...U....|
+-000000b0  45 43 44 53 41 20 50 2d  32 35 36 30 59 30 13 06  |ECDSA P-2560Y0..|
+-000000c0  07 2a 86 48 ce 3d 02 01  06 08 2a 86 48 ce 3d 03  |.*.H.=....*.H.=.|
+-000000d0  01 07 03 42 00 04 2c f1  ce a8 1b 14 c0 89 ae 59  |...B..,........Y|
+-000000e0  50 71 a2 3a 8b cb 23 57  7f ca 67 32 5f 2d 22 ed  |Pq.:..#W..g2_-".|
+-000000f0  f3 15 84 31 f7 3e 27 b1  c5 3d b8 b0 19 4c be 3f  |...1.>'..=...L.?|
+-00000100  c4 f7 85 bb 97 77 d9 2c  17 8a 19 bc 87 96 ca 88  |.....w.,........|
+-00000110  e9 6e 7f cd c1 32 a3 76  30 74 30 0e 06 03 55 1d  |.n...2.v0t0...U.|
+-00000120  0f 01 01 ff 04 04 03 02  07 80 30 13 06 03 55 1d  |..........0...U.|
+-00000130  25 04 0c 30 0a 06 08 2b  06 01 05 05 07 03 01 30  |%..0...+.......0|
+-00000140  0c 06 03 55 1d 13 01 01  ff 04 02 30 00 30 1f 06  |...U.......0.0..|
+-00000150  03 55 1d 23 04 18 30 16  80 14 9b d7 b3 0c a1 59  |.U.#..0........Y|
+-00000160  cb 9c cc dc 83 32 7f 2b  f9 30 7f f7 62 a5 30 1e  |.....2.+.0..b.0.|
+-00000170  06 03 55 1d 11 04 17 30  15 82 13 74 65 73 74 2e  |..U....0...test.|
+-00000180  67 6f 6c 61 6e 67 2e 65  78 61 6d 70 6c 65 30 0d  |golang.example0.|
+-00000190  06 09 2a 86 48 86 f7 0d  01 01 0b 05 00 03 82 01  |..*.H...........|
+-000001a0  01 00 86 b4 e8 e5 36 cc  6c ea a3 97 47 86 97 42  |......6.l...G..B|
+-000001b0  dc db 6e 3a 59 f3 06 ad  06 20 25 ee d6 95 88 0d  |..n:Y.... %.....|
+-000001c0  75 a2 f3 69 9f 7b 57 f2  98 8e 2a 6e 5d 35 cd d9  |u..i.{W...*n]5..|
+-000001d0  74 78 b3 71 56 92 c7 6b  f2 39 e0 1a c3 4a 2c 17  |tx.qV..k.9...J,.|
+-000001e0  5d 77 b7 86 68 93 f7 48  3e d5 f5 14 d7 41 dd 17  |]w..h..H>....A..|
+-000001f0  6b 81 8c b1 08 7e c4 2e  4a ae 79 b5 2e 43 6b 72  |k....~..J.y..Ckr|
+-00000200  44 53 dc 42 84 c2 fa 26  58 81 42 3d 42 71 33 5d  |DS.B...&X.B=Bq3]|
+-00000210  6b 27 72 c9 5d 96 b7 55  7b e6 34 08 a5 9e 25 f5  |k'r.]..U{.4...%.|
+-00000220  b1 e0 41 d6 9d 12 ce 17  a7 db 28 f1 ef af a3 50  |..A.......(....P|
+-00000230  db 31 3a 43 e8 ca 3e b1  70 f1 6c 44 86 e5 76 32  |.1:C..>.p.lD..v2|
+-00000240  50 8a bc 31 a7 33 f6 bb  00 6c 82 6b 24 5a eb d2  |P..1.3...l.k$Z..|
+-00000250  c9 4b bd a3 88 b1 1e 2f  d5 4e d4 cf bc 6b 6d 29  |.K...../.N...km)|
+-00000260  d2 c4 88 0c e0 a5 8c 6a  7a 7e ff 58 6d 95 22 f7  |.......jz~.Xm.".|
+-00000270  b2 6f 7a a1 46 b0 dd 56  7c a0 ef 4b c0 00 60 65  |.oz.F..V|..K..`e|
+-00000280  11 6e d0 e0 77 47 77 f2  d7 9c 04 45 bb 82 eb 4e  |.n..wGw....E...N|
+-00000290  f5 da 16 43 4d 45 c7 c7  e4 9b 08 2e d4 b4 6b 1f  |...CME........k.|
+-000002a0  df ed 16 03 03 00 72 0c  00 00 6e 03 00 1d 20 bb  |......r...n... .|
+-000002b0  af fa db e3 de 3a 65 10  e8 9b 4b be c7 04 31 92  |.....:e...K...1.|
+-000002c0  72 a2 39 97 24 0b 71 bb  86 4f f4 cb 98 39 57 04  |r.9.$.q..O...9W.|
+-000002d0  03 00 46 30 44 02 20 4e  af 50 7c 85 0b f5 bd 44  |..F0D. N.P|....D|
+-000002e0  a7 b9 4f 92 cf be 03 4d  d1 20 f5 a6 5d b2 26 69  |..O....M. ..].&i|
+-000002f0  d4 da 5d 6d ad 98 f3 02  20 77 ff ba 75 66 81 f0  |..]m.... w..uf..|
+-00000300  4c c0 6e 13 b2 60 80 cb  63 c1 6e 14 ea a5 ff db  |L.n..`..c.n.....|
+-00000310  60 a1 e4 3e 23 b1 3f ff  22 16 03 03 00 39 0d 00  |`..>#.?."....9..|
+-00000320  00 35 02 01 40 00 14 08  04 04 03 08 07 08 05 08  |.5..@...........|
+-00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
+-00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
+-00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
++000000a0  30 39 5a 30 13 31 11 30  0f 06 03 55 04 03 13 08  |09Z0.1.0...U....|
++000000b0  52 53 41 20 32 30 34 38  30 82 01 22 30 0d 06 09  |RSA 20480.."0...|
++000000c0  2a 86 48 86 f7 0d 01 01  01 05 00 03 82 01 0f 00  |*.H.............|
++000000d0  30 82 01 0a 02 82 01 01  00 e7 64 3c 52 29 21 3c  |0.........d<R)!<|
++000000e0  df 3c 9a 18 b9 9e 46 8c  1a f1 ed 83 a6 85 e4 03  |.<....F.........|
++000000f0  6c 1a 67 3d 9f 6e 4c 01  d9 2c 49 20 57 9a 65 e5  |l.g=.nL..,I W.e.|
++00000100  04 4f 83 d6 bb 5a 39 01  03 fd 87 15 8e d5 be 96  |.O...Z9.........|
++00000110  0f 2e 33 f7 b1 99 4a b7  02 73 73 7b e7 31 91 c9  |..3...J..ss{.1..|
++00000120  7b 53 a2 24 e4 99 17 7a  8c eb 34 51 7a 23 18 d1  |{S.$...z..4Qz#..|
++00000130  b6 8c 2f ac 4a 89 0d 37  09 21 e7 00 9b 38 26 7f  |../.J..7.!...8&.|
++00000140  77 97 44 84 00 82 a6 a4  c2 2a 6c ed 63 1a eb 64  |w.D......*l.c..d|
++00000150  b7 59 81 60 a7 87 32 48  f7 80 37 a8 df 84 65 1b  |.Y.`..2H..7...e.|
++00000160  25 68 a2 1e 4d 7b ae d0  d3 e9 11 72 89 1d ea 80  |%h..M{.....r....|
++00000170  c5 33 45 58 3f a5 f8 01  cb fa fc 5c 8d f0 97 74  |.3EX?......\...t|
++00000180  50 da eb 66 44 c5 88 03  42 5a b4 cb fa 60 2f 1b  |P..fD...BZ...`/.|
++00000190  10 fa ec 6a 8c 95 28 4d  fe e5 22 30 ce 7b 52 9b  |...j..(M.."0.{R.|
++000001a0  32 5e 23 76 46 50 db 4d  23 ab 60 c0 7f 4d 38 e6  |2^#vFP.M#.`..M8.|
++000001b0  a2 1b 89 c8 25 cc f1 91  7a 04 6f 2c 49 20 2b 95  |....%...z.o,I +.|
++000001c0  15 c2 e3 dd 4c 00 ff da  51 1c 0f f6 15 70 25 72  |....L...Q....p%r|
++000001d0  fb 9b d5 67 d3 27 f8 60  51 02 03 01 00 01 a3 76  |...g.'.`Q......v|
++000001e0  30 74 30 0e 06 03 55 1d  0f 01 01 ff 04 04 03 02  |0t0...U.........|
++000001f0  07 80 30 13 06 03 55 1d  25 04 0c 30 0a 06 08 2b  |..0...U.%..0...+|
++00000200  06 01 05 05 07 03 01 30  0c 06 03 55 1d 13 01 01  |.......0...U....|
++00000210  ff 04 02 30 00 30 1f 06  03 55 1d 23 04 18 30 16  |...0.0...U.#..0.|
++00000220  80 14 9b d7 b3 0c a1 59  cb 9c cc dc 83 32 7f 2b  |.......Y.....2.+|
++00000230  f9 30 7f f7 62 a5 30 1e  06 03 55 1d 11 04 17 30  |.0..b.0...U....0|
++00000240  15 82 13 74 65 73 74 2e  67 6f 6c 61 6e 67 2e 65  |...test.golang.e|
++00000250  78 61 6d 70 6c 65 30 0d  06 09 2a 86 48 86 f7 0d  |xample0...*.H...|
++00000260  01 01 0b 05 00 03 82 01  01 00 7b 76 c4 8a 00 fb  |..........{v....|
++00000270  1a 13 33 99 c2 1b 4c 8e  97 e1 36 03 73 21 aa a6  |..3...L...6.s!..|
++00000280  49 27 f8 5f f5 a4 7d 0a  54 70 6b 24 c7 03 af 28  |I'._..}.Tpk$...(|
++00000290  ce 72 3e 30 7e cc 45 3d  77 18 26 42 20 83 62 04  |.r>0~.E=w.&B .b.|
++000002a0  93 98 09 45 18 50 91 07  36 44 8a 37 4e dd 54 ce  |...E.P..6D.7N.T.|
++000002b0  3a 26 aa 98 53 9b 43 fe  d0 d9 b6 84 6e 07 c1 7d  |:&..S.C.....n..}|
++000002c0  c8 2d df 52 70 68 77 cb  2e c2 50 76 ff 6c 5c 0b  |.-.Rphw...Pv.l\.|
++000002d0  cf d6 f7 1f 2f 02 73 31  19 0a d0 32 6d 07 39 a8  |..../.s1...2m.9.|
++000002e0  45 93 6a ce 98 fd f4 de  51 e6 fd 55 7e 92 ed 8a  |E.j.....Q..U~...|
++000002f0  de 92 81 85 a1 f7 08 ea  b1 02 08 0a a5 fc 52 7e  |..............R~|
++00000300  82 46 d4 80 cd 66 5e df  1d 87 8f ab c7 f3 04 3a  |.F...f^........:|
++00000310  37 da 5d 11 dd 19 32 c0  d2 c4 f6 8e 1e 7c 23 09  |7.]...2......|#.|
++00000320  9c 12 d0 f5 7a 21 2f 3e  0e 0c 39 bb 89 70 1e 07  |....z!/>..9..p..|
++00000330  fc 06 49 7f f3 85 e1 73  12 7b 96 1d 35 ee e0 f8  |..I....s.{..5...|
++00000340  19 6a a9 a5 cb 06 09 fa  4b 05 a4 74 d0 05 ef 04  |.j......K..t....|
++00000350  ce 6d 87 f5 02 8b ff f6  6d 1e 47 40 64 4a d2 39  |.m......m.G@dJ.9|
++00000360  8c 93 03 6e 91 c1 1d e8  67 13 16 03 03 01 2c 0c  |...n....g.....,.|
++00000370  00 01 28 03 00 1d 20 bb  af fa db e3 de 3a 65 10  |..(... ......:e.|
++00000380  e8 9b 4b be c7 04 31 92  72 a2 39 97 24 0b 71 bb  |..K...1.r.9.$.q.|
++00000390  86 4f f4 cb 98 39 57 08  04 01 00 42 8f f4 00 7a  |.O...9W....B...z|
++000003a0  57 1f b4 94 af 08 08 48  fc 8c cf 39 d2 4f 7d 24  |W......H...9.O}$|
++000003b0  5a 04 f2 bf c4 0d 8f 6a  82 9b 69 aa 41 9c 35 4c  |Z......j..i.A.5L|
++000003c0  5a 60 17 6b 64 09 62 46  0f df 9e 68 6d 25 1d f0  |Z`.kd.bF...hm%..|
++000003d0  ad fa 7b 9d b8 91 84 79  f7 af f6 a1 5e c1 84 ca  |..{....y....^...|
++000003e0  ba 9e 4d 77 ec 26 3a 52  cb 98 50 81 b1 b4 aa 48  |..Mw.&:R..P....H|
++000003f0  19 1f 69 44 bd 35 f7 95  43 f1 2c 41 5a 1b 58 ad  |..iD.5..C.,AZ.X.|
++00000400  66 63 8e 11 87 27 57 65  ae 07 08 33 bf e3 2c 99  |fc...'We...3..,.|
++00000410  e6 a9 df a4 42 59 d9 3e  cb 82 2f e5 dc 2e 9b 14  |....BY.>../.....|
++00000420  08 a4 0f 7e 7f b3 c9 75  03 dc 32 0c 0c 96 5c 21  |...~...u..2...\!|
++00000430  1d af 69 b4 a1 ba 0f 79  db 09 42 ee ca b8 ed d6  |..i....y..B.....|
++00000440  19 9d 06 9e 29 8a dc b1  d4 49 58 82 53 0c 6f 8a  |....)....IX.S.o.|
++00000450  3b a2 fe 21 9a d4 d5 e0  67 84 dd 87 ea 1a 11 03  |;..!....g.......|
++00000460  89 cf 45 37 4d 74 ab 8b  68 18 95 58 44 eb 56 5d  |..E7Mt..h..XD.V]|
++00000470  bf b9 58 5a 06 94 47 85  62 11 cd 65 1e e0 7c 94  |..XZ..G.b..e..|.|
++00000480  d2 cd 3c a6 f0 01 10 37  41 2f cb 30 b5 ca 22 43  |..<....7A/.0.."C|
++00000490  0b b8 18 7a eb 34 44 0c  31 7c de 16 03 03 00 38  |...z.4D.1|.....8|
++000004a0  0d 00 00 34 01 01 00 14  08 04 04 03 08 07 08 05  |...4............|
++000004b0  08 06 04 01 05 01 06 01  05 03 06 03 00 1a 00 18  |................|
++000004c0  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
++000004d0  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
++000004e0  00                                                |.|
+ >>> Flow 3 (client to server)
+ 00000000  16 03 03 03 33 0b 00 03  2f 00 03 2c 00 03 29 30  |....3.../..,..)0|
+ 00000010  82 03 25 30 82 02 0d a0  03 02 01 02 02 01 0c 30  |..%0...........0|
+@@ -121,33 +146,33 @@
+ 00000310  d1 29 4b 73 e6 ee cf ae  30 c2 01 89 d6 d5 b1 ce  |.)Ks....0.......|
+ 00000320  f2 80 9f 7e 6b 2e 8b ef  ee c1 37 59 c5 8f e6 ec  |...~k.....7Y....|
+ 00000330  7f f9 3a c9 3f 18 71 39  16 03 03 00 25 10 00 00  |..:.?.q9....%...|
+-00000340  21 20 79 e2 cb 81 55 42  b9 7f ff 98 af b1 df 22  |! y...UB......."|
+-00000350  a1 ef e2 46 3e 27 c4 3a  c7 9c 46 72 40 f5 9d 5b  |...F>'.:..Fr@..[|
+-00000360  5b 0c 16 03 03 01 08 0f  00 01 04 08 04 01 00 ce  |[...............|
+-00000370  07 43 48 0c 18 fc 6b c4  c4 41 93 54 2a c0 5b cf  |.CH...k..A.T*.[.|
+-00000380  f9 ff 61 08 d3 7d e6 ce  4b 21 2d c2 aa 4e 19 34  |..a..}..K!-..N.4|
+-00000390  4d 82 33 8a 30 ed aa 4e  d1 07 2f fe e2 2b f4 95  |M.3.0..N../..+..|
+-000003a0  cf 7f 99 da 75 44 ac cc  be ac 80 8b 5d 88 72 23  |....uD......].r#|
+-000003b0  6d 58 78 66 39 95 06 92  21 41 74 18 b7 21 77 08  |mXxf9...!At..!w.|
+-000003c0  47 89 78 cd b8 31 69 32  d9 f8 e1 d6 dd 0d 39 ad  |G.x..1i2......9.|
+-000003d0  98 ab 63 46 01 46 0d d5  f4 b8 30 e6 db 26 7e 80  |..cF.F....0..&~.|
+-000003e0  4b 30 11 1e bd b8 e1 47  74 c9 bb 8c db d0 cd 8f  |K0.....Gt.......|
+-000003f0  5a f7 2b 2d 48 05 3e 95  f7 e6 05 9c 9b 24 5a 9b  |Z.+-H.>......$Z.|
+-00000400  d0 34 0a 60 a1 2a 71 2f  ff ca 7f 57 3e 97 a7 f7  |.4.`.*q/...W>...|
+-00000410  22 68 98 ce 03 6f 04 8d  75 69 e3 6a f2 ed 66 8e  |"h...o..ui.j..f.|
+-00000420  d5 d9 da 56 9d 25 d2 04  fd d4 6b 5d af fe 75 8f  |...V.%....k]..u.|
+-00000430  36 3f 65 58 42 bb e6 ba  8c 42 fe c2 6f c1 cf 28  |6?eXB....B..o..(|
+-00000440  55 e2 84 7b 07 2e e8 8c  ee a1 42 cb 63 b6 25 41  |U..{......B.c.%A|
+-00000450  74 7f 9e 07 88 06 4b 35  25 7c 28 1a bc 84 c8 3d  |t.....K5%|(....=|
+-00000460  7c a7 4d 05 d1 bc c1 cc  92 d9 7c 49 42 5a dc 14  ||.M.......|IBZ..|
+-00000470  03 03 00 01 01 16 03 03  00 20 9e 2c 59 db a5 67  |......... .,Y..g|
+-00000480  94 3f 73 7d 08 39 25 2b  52 97 70 33 9f 75 d6 49  |.?s}.9%+R.p3.u.I|
+-00000490  b0 c3 78 76 1a 95 d4 5b  8c 82                    |..xv...[..|
++00000340  21 20 a8 ba 12 01 3a 18  d6 3a 48 36 75 4a 39 43  |! ....:..:H6uJ9C|
++00000350  a6 a0 44 de 97 68 e4 ef  9a d6 36 99 36 af d2 6d  |..D..h....6.6..m|
++00000360  f9 1b 16 03 03 01 08 0f  00 01 04 08 04 01 00 39  |...............9|
++00000370  ba 0e 68 18 6c 80 2b 0c  26 ba e6 7b aa 5b 33 ef  |..h.l.+.&..{.[3.|
++00000380  47 26 8b f1 90 73 42 f6  ac bf f4 3d 01 67 a7 a4  |G&...sB....=.g..|
++00000390  c6 46 fe f1 bc 69 03 a3  86 f8 88 72 9e 0e d7 b4  |.F...i.....r....|
++000003a0  7a 03 6b 47 cb 70 dd 59  4c c6 d5 29 0d 27 55 43  |z.kG.p.YL..).'UC|
++000003b0  1c 1f 03 77 f4 ae df 45  a2 8d e3 4f b6 b2 0d 47  |...w...E...O...G|
++000003c0  8a c7 0c aa ad f0 ab cf  d8 ab 27 77 6f 33 44 6d  |..........'wo3Dm|
++000003d0  a8 b1 62 6d 02 17 e3 5e  05 85 95 37 cb ec c8 38  |..bm...^...7...8|
++000003e0  3c d5 d6 81 6c cf d2 f9  24 69 49 f9 73 1a 2b 49  |<...l...$iI.s.+I|
++000003f0  fe 74 81 01 fa 0c 78 b9  36 4b f8 e6 a6 35 19 ac  |.t....x.6K...5..|
++00000400  ee 1b 8f 5d 5d b8 b1 61  47 9f fb 21 80 ef ad 06  |...]]..aG..!....|
++00000410  76 36 5d 00 d0 87 aa 0d  14 d3 d2 8d ea 1f 2e 65  |v6]............e|
++00000420  e9 a0 9f fa a9 a0 2e f2  c2 4b 14 6f 37 fe e4 01  |.........K.o7...|
++00000430  db 25 46 c3 5f 04 95 ff  45 84 bf 00 d5 f0 e5 45  |.%F._...E......E|
++00000440  30 10 41 bc fd 55 f9 34  eb 74 6c 48 8d 59 32 59  |0.A..U.4.tlH.Y2Y|
++00000450  1f 7e f2 eb 9b aa 1f 85  a1 a2 e8 18 9f 5b 6e 60  |.~...........[n`|
++00000460  7e 33 75 45 70 50 36 a6  3f 37 04 c3 30 21 fc 14  |~3uEpP6.?7..0!..|
++00000470  03 03 00 01 01 16 03 03  00 20 c9 8c d8 b8 30 2c  |......... ....0,|
++00000480  5d 4e c3 1e 3d 64 f4 f8  84 41 e5 f6 c5 df b9 a4  |]N..=d...A......|
++00000490  db 34 11 d6 81 98 76 9f  c1 c6                    |.4....v...|
+ >>> Flow 4 (server to client)
+-00000000  14 03 03 00 01 01 16 03  03 00 20 3f d7 05 3a 5b  |.......... ?..:[|
+-00000010  69 42 97 4d 8c 95 9e 3e  27 e3 66 8d 92 f5 60 69  |iB.M...>'.f...`i|
+-00000020  7f 74 4b 3e b6 6f 29 e0  4b db d1 17 03 03 00 1d  |.tK>.o).K.......|
+-00000030  59 6f aa e9 3e 4a 2d 82  0b 2e 23 fa 89 1e 7b 8b  |Yo..>J-...#...{.|
+-00000040  a0 a4 fb 19 03 13 f3 b8  a3 19 5d 2f 66 15 03 03  |..........]/f...|
+-00000050  00 12 e7 f4 d7 06 f9 e0  aa 8c 72 64 8d 27 a4 1d  |..........rd.'..|
+-00000060  97 5e d9 e8                                       |.^..|
++00000000  14 03 03 00 01 01 16 03  03 00 20 95 6b 40 da 1d  |.......... .k@..|
++00000010  ac ea b8 5d 84 49 35 9f  e3 f4 a2 d7 13 e6 8b 51  |...].I5........Q|
++00000020  f5 c9 0c 58 8f c6 0b 7d  7d 9d f1 17 03 03 00 1d  |...X...}}.......|
++00000030  f5 b6 a7 6f 8f cf c6 dd  18 f3 32 1d 69 8c 10 62  |...o......2.i..b|
++00000040  ca 8e af 51 9f f6 c7 9d  2e 3c 0c a6 8d 15 03 03  |...Q.....<......|
++00000050  00 12 30 90 e9 eb 77 a7  e3 c1 c3 1b 47 f3 03 33  |..0...w.....G..3|
++00000060  f0 97 35 b3                                       |..5.|
+diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given
+--- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given
++++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given
+@@ -1,7 +1,7 @@
+ >>> Flow 1 (client to server)
+-00000000  16 03 01 00 d5 01 00 00  d1 03 03 92 ca c8 a7 98  |................|
+-00000010  c9 3b 29 e5 1e 72 e6 92  42 e0 3b 9f 5a 65 73 09  |.;)..r..B.;.Zes.|
+-00000020  08 1c 53 d2 d0 62 48 4e  d8 a6 89 00 00 38 c0 2c  |..S..bHN.....8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 49 49 7b b2 80  |...........II{..|
++00000010  a3 88 28 5c 4d c7 07 07  14 95 b7 ba 65 b0 ca 8f  |..(\M.......e...|
++00000020  8a f6 2c 23 01 b6 bf f2  f1 f4 bf 00 00 38 c0 2c  |..,#.........8.,|
+ 00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
+ 00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
+ 00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
+@@ -16,59 +16,83 @@
+ >>> Flow 2 (server to client)
+ 00000000  16 03 03 00 3f 02 00 00  3b 03 03 2c 84 0e c3 c0  |....?...;..,....|
+ 00000010  fd 58 12 43 ce a3 e8 28  a1 5c 70 ce 9a 7f 3b 59  |.X.C...(.\p...;Y|
+-00000020  f9 a2 aa 44 4f 57 4e 47  52 44 01 00 cc a9 00 00  |...DOWNGRD......|
++00000020  f9 a2 aa 44 4f 57 4e 47  52 44 01 00 cc a8 00 00  |...DOWNGRD......|
+ 00000030  13 ff 01 00 01 00 00 17  00 00 00 0b 00 02 01 00  |................|
+-00000040  00 00 00 00 16 03 03 02  59 0b 00 02 55 00 02 52  |........Y...U..R|
+-00000050  00 02 4f 30 82 02 4b 30  82 01 33 a0 03 02 01 02  |..O0..K0..3.....|
+-00000060  02 01 03 30 0d 06 09 2a  86 48 86 f7 0d 01 01 0b  |...0...*.H......|
++00000040  00 00 00 00 16 03 03 03  21 0b 00 03 1d 00 03 1a  |........!.......|
++00000050  00 03 17 30 82 03 13 30  82 01 fb a0 03 02 01 02  |...0...0........|
++00000060  02 01 04 30 0d 06 09 2a  86 48 86 f7 0d 01 01 0b  |...0...*.H......|
+ 00000070  05 00 30 0f 31 0d 30 0b  06 03 55 04 03 13 04 52  |..0.1.0...U....R|
+ 00000080  6f 6f 74 30 1e 17 0d 31  36 30 37 31 32 31 37 33  |oot0...160712173|
+ 00000090  32 30 39 5a 17 0d 31 37  30 31 32 38 31 37 33 32  |209Z..1701281732|
+-000000a0  30 39 5a 30 16 31 14 30  12 06 03 55 04 03 13 0b  |09Z0.1.0...U....|
+-000000b0  45 43 44 53 41 20 50 2d  32 35 36 30 59 30 13 06  |ECDSA P-2560Y0..|
+-000000c0  07 2a 86 48 ce 3d 02 01  06 08 2a 86 48 ce 3d 03  |.*.H.=....*.H.=.|
+-000000d0  01 07 03 42 00 04 2c f1  ce a8 1b 14 c0 89 ae 59  |...B..,........Y|
+-000000e0  50 71 a2 3a 8b cb 23 57  7f ca 67 32 5f 2d 22 ed  |Pq.:..#W..g2_-".|
+-000000f0  f3 15 84 31 f7 3e 27 b1  c5 3d b8 b0 19 4c be 3f  |...1.>'..=...L.?|
+-00000100  c4 f7 85 bb 97 77 d9 2c  17 8a 19 bc 87 96 ca 88  |.....w.,........|
+-00000110  e9 6e 7f cd c1 32 a3 76  30 74 30 0e 06 03 55 1d  |.n...2.v0t0...U.|
+-00000120  0f 01 01 ff 04 04 03 02  07 80 30 13 06 03 55 1d  |..........0...U.|
+-00000130  25 04 0c 30 0a 06 08 2b  06 01 05 05 07 03 01 30  |%..0...+.......0|
+-00000140  0c 06 03 55 1d 13 01 01  ff 04 02 30 00 30 1f 06  |...U.......0.0..|
+-00000150  03 55 1d 23 04 18 30 16  80 14 9b d7 b3 0c a1 59  |.U.#..0........Y|
+-00000160  cb 9c cc dc 83 32 7f 2b  f9 30 7f f7 62 a5 30 1e  |.....2.+.0..b.0.|
+-00000170  06 03 55 1d 11 04 17 30  15 82 13 74 65 73 74 2e  |..U....0...test.|
+-00000180  67 6f 6c 61 6e 67 2e 65  78 61 6d 70 6c 65 30 0d  |golang.example0.|
+-00000190  06 09 2a 86 48 86 f7 0d  01 01 0b 05 00 03 82 01  |..*.H...........|
+-000001a0  01 00 86 b4 e8 e5 36 cc  6c ea a3 97 47 86 97 42  |......6.l...G..B|
+-000001b0  dc db 6e 3a 59 f3 06 ad  06 20 25 ee d6 95 88 0d  |..n:Y.... %.....|
+-000001c0  75 a2 f3 69 9f 7b 57 f2  98 8e 2a 6e 5d 35 cd d9  |u..i.{W...*n]5..|
+-000001d0  74 78 b3 71 56 92 c7 6b  f2 39 e0 1a c3 4a 2c 17  |tx.qV..k.9...J,.|
+-000001e0  5d 77 b7 86 68 93 f7 48  3e d5 f5 14 d7 41 dd 17  |]w..h..H>....A..|
+-000001f0  6b 81 8c b1 08 7e c4 2e  4a ae 79 b5 2e 43 6b 72  |k....~..J.y..Ckr|
+-00000200  44 53 dc 42 84 c2 fa 26  58 81 42 3d 42 71 33 5d  |DS.B...&X.B=Bq3]|
+-00000210  6b 27 72 c9 5d 96 b7 55  7b e6 34 08 a5 9e 25 f5  |k'r.]..U{.4...%.|
+-00000220  b1 e0 41 d6 9d 12 ce 17  a7 db 28 f1 ef af a3 50  |..A.......(....P|
+-00000230  db 31 3a 43 e8 ca 3e b1  70 f1 6c 44 86 e5 76 32  |.1:C..>.p.lD..v2|
+-00000240  50 8a bc 31 a7 33 f6 bb  00 6c 82 6b 24 5a eb d2  |P..1.3...l.k$Z..|
+-00000250  c9 4b bd a3 88 b1 1e 2f  d5 4e d4 cf bc 6b 6d 29  |.K...../.N...km)|
+-00000260  d2 c4 88 0c e0 a5 8c 6a  7a 7e ff 58 6d 95 22 f7  |.......jz~.Xm.".|
+-00000270  b2 6f 7a a1 46 b0 dd 56  7c a0 ef 4b c0 00 60 65  |.oz.F..V|..K..`e|
+-00000280  11 6e d0 e0 77 47 77 f2  d7 9c 04 45 bb 82 eb 4e  |.n..wGw....E...N|
+-00000290  f5 da 16 43 4d 45 c7 c7  e4 9b 08 2e d4 b4 6b 1f  |...CME........k.|
+-000002a0  df ed 16 03 03 00 73 0c  00 00 6f 03 00 1d 20 bb  |......s...o... .|
+-000002b0  af fa db e3 de 3a 65 10  e8 9b 4b be c7 04 31 92  |.....:e...K...1.|
+-000002c0  72 a2 39 97 24 0b 71 bb  86 4f f4 cb 98 39 57 04  |r.9.$.q..O...9W.|
+-000002d0  03 00 47 30 45 02 21 00  d9 b1 30 5c 6b 3c e9 eb  |..G0E.!...0\k<..|
+-000002e0  ed a9 92 81 ac 95 14 6b  ae a5 7c dc 09 39 61 6a  |.......k..|..9aj|
+-000002f0  3a c2 11 a8 1f 52 fb 72  02 20 5e db e3 01 eb d3  |:....R.r. ^.....|
+-00000300  bd b3 35 85 6a d0 cc 86  6a 3d 26 01 64 65 39 69  |..5.j...j=&.de9i|
+-00000310  09 84 5f 07 fa 03 9e 43  74 00 16 03 03 00 39 0d  |.._....Ct.....9.|
+-00000320  00 00 35 02 01 40 00 14  08 04 04 03 08 07 08 05  |..5..@..........|
+-00000330  08 06 04 01 05 01 06 01  05 03 06 03 00 1a 00 18  |................|
+-00000340  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
+-00000350  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
+-00000360  00                                                |.|
++000000a0  30 39 5a 30 13 31 11 30  0f 06 03 55 04 03 13 08  |09Z0.1.0...U....|
++000000b0  52 53 41 20 32 30 34 38  30 82 01 22 30 0d 06 09  |RSA 20480.."0...|
++000000c0  2a 86 48 86 f7 0d 01 01  01 05 00 03 82 01 0f 00  |*.H.............|
++000000d0  30 82 01 0a 02 82 01 01  00 e7 64 3c 52 29 21 3c  |0.........d<R)!<|
++000000e0  df 3c 9a 18 b9 9e 46 8c  1a f1 ed 83 a6 85 e4 03  |.<....F.........|
++000000f0  6c 1a 67 3d 9f 6e 4c 01  d9 2c 49 20 57 9a 65 e5  |l.g=.nL..,I W.e.|
++00000100  04 4f 83 d6 bb 5a 39 01  03 fd 87 15 8e d5 be 96  |.O...Z9.........|
++00000110  0f 2e 33 f7 b1 99 4a b7  02 73 73 7b e7 31 91 c9  |..3...J..ss{.1..|
++00000120  7b 53 a2 24 e4 99 17 7a  8c eb 34 51 7a 23 18 d1  |{S.$...z..4Qz#..|
++00000130  b6 8c 2f ac 4a 89 0d 37  09 21 e7 00 9b 38 26 7f  |../.J..7.!...8&.|
++00000140  77 97 44 84 00 82 a6 a4  c2 2a 6c ed 63 1a eb 64  |w.D......*l.c..d|
++00000150  b7 59 81 60 a7 87 32 48  f7 80 37 a8 df 84 65 1b  |.Y.`..2H..7...e.|
++00000160  25 68 a2 1e 4d 7b ae d0  d3 e9 11 72 89 1d ea 80  |%h..M{.....r....|
++00000170  c5 33 45 58 3f a5 f8 01  cb fa fc 5c 8d f0 97 74  |.3EX?......\...t|
++00000180  50 da eb 66 44 c5 88 03  42 5a b4 cb fa 60 2f 1b  |P..fD...BZ...`/.|
++00000190  10 fa ec 6a 8c 95 28 4d  fe e5 22 30 ce 7b 52 9b  |...j..(M.."0.{R.|
++000001a0  32 5e 23 76 46 50 db 4d  23 ab 60 c0 7f 4d 38 e6  |2^#vFP.M#.`..M8.|
++000001b0  a2 1b 89 c8 25 cc f1 91  7a 04 6f 2c 49 20 2b 95  |....%...z.o,I +.|
++000001c0  15 c2 e3 dd 4c 00 ff da  51 1c 0f f6 15 70 25 72  |....L...Q....p%r|
++000001d0  fb 9b d5 67 d3 27 f8 60  51 02 03 01 00 01 a3 76  |...g.'.`Q......v|
++000001e0  30 74 30 0e 06 03 55 1d  0f 01 01 ff 04 04 03 02  |0t0...U.........|
++000001f0  07 80 30 13 06 03 55 1d  25 04 0c 30 0a 06 08 2b  |..0...U.%..0...+|
++00000200  06 01 05 05 07 03 01 30  0c 06 03 55 1d 13 01 01  |.......0...U....|
++00000210  ff 04 02 30 00 30 1f 06  03 55 1d 23 04 18 30 16  |...0.0...U.#..0.|
++00000220  80 14 9b d7 b3 0c a1 59  cb 9c cc dc 83 32 7f 2b  |.......Y.....2.+|
++00000230  f9 30 7f f7 62 a5 30 1e  06 03 55 1d 11 04 17 30  |.0..b.0...U....0|
++00000240  15 82 13 74 65 73 74 2e  67 6f 6c 61 6e 67 2e 65  |...test.golang.e|
++00000250  78 61 6d 70 6c 65 30 0d  06 09 2a 86 48 86 f7 0d  |xample0...*.H...|
++00000260  01 01 0b 05 00 03 82 01  01 00 7b 76 c4 8a 00 fb  |..........{v....|
++00000270  1a 13 33 99 c2 1b 4c 8e  97 e1 36 03 73 21 aa a6  |..3...L...6.s!..|
++00000280  49 27 f8 5f f5 a4 7d 0a  54 70 6b 24 c7 03 af 28  |I'._..}.Tpk$...(|
++00000290  ce 72 3e 30 7e cc 45 3d  77 18 26 42 20 83 62 04  |.r>0~.E=w.&B .b.|
++000002a0  93 98 09 45 18 50 91 07  36 44 8a 37 4e dd 54 ce  |...E.P..6D.7N.T.|
++000002b0  3a 26 aa 98 53 9b 43 fe  d0 d9 b6 84 6e 07 c1 7d  |:&..S.C.....n..}|
++000002c0  c8 2d df 52 70 68 77 cb  2e c2 50 76 ff 6c 5c 0b  |.-.Rphw...Pv.l\.|
++000002d0  cf d6 f7 1f 2f 02 73 31  19 0a d0 32 6d 07 39 a8  |..../.s1...2m.9.|
++000002e0  45 93 6a ce 98 fd f4 de  51 e6 fd 55 7e 92 ed 8a  |E.j.....Q..U~...|
++000002f0  de 92 81 85 a1 f7 08 ea  b1 02 08 0a a5 fc 52 7e  |..............R~|
++00000300  82 46 d4 80 cd 66 5e df  1d 87 8f ab c7 f3 04 3a  |.F...f^........:|
++00000310  37 da 5d 11 dd 19 32 c0  d2 c4 f6 8e 1e 7c 23 09  |7.]...2......|#.|
++00000320  9c 12 d0 f5 7a 21 2f 3e  0e 0c 39 bb 89 70 1e 07  |....z!/>..9..p..|
++00000330  fc 06 49 7f f3 85 e1 73  12 7b 96 1d 35 ee e0 f8  |..I....s.{..5...|
++00000340  19 6a a9 a5 cb 06 09 fa  4b 05 a4 74 d0 05 ef 04  |.j......K..t....|
++00000350  ce 6d 87 f5 02 8b ff f6  6d 1e 47 40 64 4a d2 39  |.m......m.G@dJ.9|
++00000360  8c 93 03 6e 91 c1 1d e8  67 13 16 03 03 01 2c 0c  |...n....g.....,.|
++00000370  00 01 28 03 00 1d 20 bb  af fa db e3 de 3a 65 10  |..(... ......:e.|
++00000380  e8 9b 4b be c7 04 31 92  72 a2 39 97 24 0b 71 bb  |..K...1.r.9.$.q.|
++00000390  86 4f f4 cb 98 39 57 08  04 01 00 8a cf 48 05 47  |.O...9W......H.G|
++000003a0  79 b1 02 f6 51 36 56 3b  13 1c 60 dc 14 40 d3 c6  |y...Q6V;..`..@..|
++000003b0  25 d4 63 38 95 af 2a 7a  d7 33 ca 23 53 58 86 d1  |%.c8..*z.3.#SX..|
++000003c0  7d 28 05 7e c8 23 73 6d  33 c8 4d 25 6e 10 db 5c  |}(.~.#sm3.M%n..\|
++000003d0  ae 51 40 44 fd 4b da 3c  de 82 2b b2 e7 c3 40 44  |.Q@D.K.<..+...@D|
++000003e0  82 64 ba bf 4d 09 0a 5c  32 f7 85 01 3a 8b a5 96  |.d..M..\2...:...|
++000003f0  34 da 34 89 b0 31 21 11  fd 0d 7b 1f eb 7f e3 3c  |4.4..1!...{....<|
++00000400  ac 7d f5 ed 9c c4 f3 c0  d5 57 dc 7c 15 5f 78 43  |.}.......W.|._xC|
++00000410  dd 04 9c 61 a3 8c b9 4e  d9 49 6f b8 8f c7 18 29  |...a...N.Io....)|
++00000420  d6 8f 29 73 1f b9 79 1c  29 34 9c 75 88 2b 8a ea  |..)s..y.)4.u.+..|
++00000430  b3 b1 58 0d a5 94 3f f7  ed 89 0f 17 80 81 82 d4  |..X...?.........|
++00000440  b5 e2 f4 dd 15 a2 ee 47  66 0f 8c 14 63 99 89 bf  |.......Gf...c...|
++00000450  da 85 cf 68 88 45 ff 83  fc 46 3b de ee f5 79 2c  |...h.E...F;...y,|
++00000460  17 af 72 1d 0a 57 48 5b  53 95 c0 23 75 fd bc de  |..r..WH[S..#u...|
++00000470  6f ce bf 98 a8 9b 61 8a  7e 5d f6 ab aa f2 2a cd  |o.....a.~]....*.|
++00000480  ea df 45 3a e7 fa 19 c7  0c cb 51 7c 3c d3 8f 35  |..E:......Q|<..5|
++00000490  a6 a0 ef 31 9c 6b 57 95  a3 1c 26 16 03 03 00 38  |...1.kW...&....8|
++000004a0  0d 00 00 34 01 01 00 14  08 04 04 03 08 07 08 05  |...4............|
++000004b0  08 06 04 01 05 01 06 01  05 03 06 03 00 1a 00 18  |................|
++000004c0  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
++000004d0  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
++000004e0  00                                                |.|
+ >>> Flow 3 (client to server)
+ 00000000  16 03 03 03 33 0b 00 03  2f 00 03 2c 00 03 29 30  |....3.../..,..)0|
+ 00000010  82 03 25 30 82 02 0d a0  03 02 01 02 02 01 0c 30  |..%0...........0|
+@@ -122,33 +146,33 @@
+ 00000310  d1 29 4b 73 e6 ee cf ae  30 c2 01 89 d6 d5 b1 ce  |.)Ks....0.......|
+ 00000320  f2 80 9f 7e 6b 2e 8b ef  ee c1 37 59 c5 8f e6 ec  |...~k.....7Y....|
+ 00000330  7f f9 3a c9 3f 18 71 39  16 03 03 00 25 10 00 00  |..:.?.q9....%...|
+-00000340  21 20 58 51 83 16 18 fe  a1 29 d4 ff f2 91 5a c1  |! XQ.....)....Z.|
+-00000350  78 93 ac 26 57 4b b0 45  80 9c 0b 32 6a e3 ab 58  |x..&WK.E...2j..X|
+-00000360  f5 11 16 03 03 01 08 0f  00 01 04 04 01 01 00 b8  |................|
+-00000370  82 f8 37 8a c8 63 bd 90  6a 16 68 c7 7f c5 6e dd  |..7..c..j.h...n.|
+-00000380  8c cd 2b 26 88 a4 63 42  a1 49 b9 5d 4f fe c6 bd  |..+&..cB.I.]O...|
+-00000390  80 29 29 0e 9e 6e 29 83  67 0a ba ab 95 86 1a ed  |.))..n).g.......|
+-000003a0  6b ed ff d8 f5 38 73 ad  7c ab 32 1c fa dc 6f 1d  |k....8s.|.2...o.|
+-000003b0  34 38 86 95 25 3b 1c e4  7c 9b 31 cb ad c2 bc b3  |48..%;..|.1.....|
+-000003c0  28 01 c6 7c a7 92 41 93  b4 6f 51 4c 2e be 89 b4  |(..|..A..oQL....|
+-000003d0  ba 5c 78 97 c3 6b a3 91  67 d8 4a 7d 2f da fe d1  |.\x..k..g.J}/...|
+-000003e0  40 f0 00 f5 78 31 39 bf  d2 7e ed 39 18 5b f6 af  |@...x19..~.9.[..|
+-000003f0  69 c7 92 1a 67 1e 9b 8d  23 0a 7e 54 f7 a5 42 98  |i...g...#.~T..B.|
+-00000400  5e 10 82 99 5b a7 08 e9  19 fa 05 56 8f 00 33 bf  |^...[......V..3.|
+-00000410  bd c7 01 1f 71 bb e5 3b  df 29 48 67 ea 28 bf 8f  |....q..;.)Hg.(..|
+-00000420  c4 33 ba 04 f7 7e 38 8f  0f e6 16 0b b6 53 d9 fd  |.3...~8......S..|
+-00000430  ba 9f 11 29 77 d9 79 a8  f7 06 13 24 17 17 ce 4d  |...)w.y....$...M|
+-00000440  a8 1b 7a c3 9d e5 03 c5  b2 a6 f4 bf d5 6e 7a 41  |..z..........nzA|
+-00000450  e2 fe 14 d9 f4 3f c3 31  c0 3f 07 46 db c7 02 1a  |.....?.1.?.F....|
+-00000460  c6 d8 81 05 0a 0f ee c7  da e4 14 92 e3 f3 29 14  |..............).|
+-00000470  03 03 00 01 01 16 03 03  00 20 a8 10 35 03 41 09  |......... ..5.A.|
+-00000480  23 ef a4 63 28 ed f6 48  a9 73 c8 46 2b c9 41 9f  |#..c(..H.s.F+.A.|
+-00000490  87 46 70 05 95 d4 c3 a3  90 d2                    |.Fp.......|
++00000340  21 20 88 15 c1 c6 98 fc  46 e8 cf 53 7f 71 f9 5d  |! ......F..S.q.]|
++00000350  e9 49 b2 44 89 94 a4 c3  a7 26 01 a9 10 98 0a 7c  |.I.D.....&.....||
++00000360  69 52 16 03 03 01 08 0f  00 01 04 04 01 01 00 96  |iR..............|
++00000370  6b 61 06 99 bf 6e 50 bb  40 0a 0e 15 52 70 b2 42  |ka...nP.@...Rp.B|
++00000380  62 43 af 97 52 8a 3c 8b  18 65 5c 33 d2 94 a0 45  |bC..R.<..e\3...E|
++00000390  aa 34 4a 02 e6 97 b4 22  9c 7a ac 42 e7 bf 9d 8b  |.4J....".z.B....|
++000003a0  e7 12 41 ab c6 a6 5f 16  12 de b4 e8 7a 16 d8 0e  |..A..._.....z...|
++000003b0  75 ef 55 65 cf f2 15 8d  2e e5 69 87 22 d7 71 72  |u.Ue......i.".qr|
++000003c0  db e4 26 71 26 bd 17 b9  62 a1 94 d5 9a a8 e7 75  |..&q&...b......u|
++000003d0  58 fe 7c be 9d bc 3f 02  1d 7a d2 c1 97 9b 2c 84  |X.|...?..z....,.|
++000003e0  c3 28 f8 bb 24 c6 7a d6  4b be 50 fe 84 8c 1b 86  |.(..$.z.K.P.....|
++000003f0  56 c3 8d 2f 12 a3 56 4e  d0 fc b6 71 01 3e 1f 85  |V../..VN...q.>..|
++00000400  8d 0f 36 4e 67 b2 ea bd  bb 74 db f7 3c 46 46 25  |..6Ng....t..<FF%|
++00000410  5b e2 08 ce 91 3f c8 10  5d 47 ab ee 85 c5 0a 61  |[....?..]G.....a|
++00000420  82 ac 54 ae b2 fb 24 a9  19 1b 2f 01 1d 55 4c 58  |..T...$.../..ULX|
++00000430  94 4b 42 f3 5c d1 66 de  01 36 45 a6 27 1d 33 be  |.KB.\.f..6E.'.3.|
++00000440  63 78 52 00 47 b2 56 44  ff 08 f0 96 3b 5f ca 3f  |cxR.G.VD....;_.?|
++00000450  f5 ea 5e 60 41 f5 58 df  8e 12 07 7a 7c 7f 6d c2  |..^`A.X....z|.m.|
++00000460  d0 49 b1 03 ff 92 46 76  e2 fb af 7a b1 d8 d0 14  |.I....Fv...z....|
++00000470  03 03 00 01 01 16 03 03  00 20 59 b7 75 7c 0f 47  |......... Y.u|.G|
++00000480  51 d9 2a 20 cd 33 0b 00  41 73 5a 0d dd d7 ed 51  |Q.* .3..AsZ....Q|
++00000490  ea 41 18 3a fb b0 c2 f0  55 78                    |.A.:....Ux|
+ >>> Flow 4 (server to client)
+-00000000  14 03 03 00 01 01 16 03  03 00 20 eb e4 5a 0f f2  |.......... ..Z..|
+-00000010  60 59 99 71 9a 30 03 8f  fb 8d 5a e7 de d2 17 bc  |`Y.q.0....Z.....|
+-00000020  69 49 be e3 07 15 05 f5  04 21 4b 17 03 03 00 1d  |iI.......!K.....|
+-00000030  31 c8 e5 d8 42 3a 22 33  38 df 4b d9 b1 5b aa b4  |1...B:"38.K..[..|
+-00000040  ee 38 2e f0 54 37 80 18  c7 f3 42 63 bd 15 03 03  |.8..T7....Bc....|
+-00000050  00 12 1b 1e d4 ea 0d 65  2f 0e 65 99 5c 76 a5 94  |.......e/.e.\v..|
+-00000060  82 91 cd d5                                       |....|
++00000000  14 03 03 00 01 01 16 03  03 00 20 f0 61 29 4d 72  |.......... .a)Mr|
++00000010  c7 29 92 48 e5 cc a7 fc  3b d1 93 81 b6 7a 2f 52  |.).H....;....z/R|
++00000020  f5 7f 8c 57 88 1d 73 77  49 f5 a7 17 03 03 00 1d  |...W..swI.......|
++00000030  40 15 31 f6 b9 2f db 3d  2e 59 a3 39 66 82 6b 30  |@.1../.=.Y.9f.k0|
++00000040  6b ab 32 72 6a 77 70 f6  50 a9 e9 6b 2b 15 03 03  |k.2rjwp.P..k+...|
++00000050  00 12 de e2 af 25 79 bf  64 b3 7d 17 e7 c6 10 a3  |.....%y.d.}.....|
++00000060  6f 4e aa 06                                       |oN..|
+diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven
+--- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven
++++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven
+@@ -1,7 +1,7 @@
+ >>> Flow 1 (client to server)
+-00000000  16 03 01 00 d5 01 00 00  d1 03 03 c5 ed 60 aa 56  |.............`.V|
+-00000010  36 52 e9 79 7e 79 c5 48  83 d3 79 e8 08 49 56 f6  |6R.y~y.H..y..IV.|
+-00000020  85 70 9d 9b be d6 60 49  6a c6 88 00 00 38 c0 2c  |.p....`Ij....8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 25 75 1d cd 9f  |...........%u...|
++00000010  14 51 40 4a f1 9f 4b 5d  08 71 f5 63 c6 00 c5 78  |.Q@J..K].q.c...x|
++00000020  1f 3c 06 fb 04 a2 ec b9  18 79 37 00 00 38 c0 2c  |.<.......y7..8.,|
+ 00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
+ 00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
+ 00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
+@@ -56,32 +56,31 @@
+ 00000270  b2 6f 7a a1 46 b0 dd 56  7c a0 ef 4b c0 00 60 65  |.oz.F..V|..K..`e|
+ 00000280  11 6e d0 e0 77 47 77 f2  d7 9c 04 45 bb 82 eb 4e  |.n..wGw....E...N|
+ 00000290  f5 da 16 43 4d 45 c7 c7  e4 9b 08 2e d4 b4 6b 1f  |...CME........k.|
+-000002a0  df ed 16 03 03 00 74 0c  00 00 70 03 00 1d 20 bb  |......t...p... .|
++000002a0  df ed 16 03 03 00 73 0c  00 00 6f 03 00 1d 20 bb  |......s...o... .|
+ 000002b0  af fa db e3 de 3a 65 10  e8 9b 4b be c7 04 31 92  |.....:e...K...1.|
+ 000002c0  72 a2 39 97 24 0b 71 bb  86 4f f4 cb 98 39 57 04  |r.9.$.q..O...9W.|
+-000002d0  03 00 48 30 46 02 21 00  fc 41 ef c7 fb 7e 98 1f  |..H0F.!..A...~..|
+-000002e0  29 42 15 e2 87 24 39 55  00 50 3b 05 28 07 89 cc  |)B...$9U.P;.(...|
+-000002f0  ba ea b8 d0 33 f0 f5 d7  02 21 00 c8 85 b6 e6 3b  |....3....!.....;|
+-00000300  e9 13 b8 d2 33 90 12 4c  a3 95 61 70 a0 6b 44 e1  |....3..L..ap.kD.|
+-00000310  5a 72 c1 47 19 c4 04 67  86 5b 6b 16 03 03 00 39  |Zr.G...g.[k....9|
+-00000320  0d 00 00 35 02 01 40 00  14 08 04 04 03 08 07 08  |...5..@.........|
+-00000330  05 08 06 04 01 05 01 06  01 05 03 06 03 00 1a 00  |................|
+-00000340  18 30 16 31 14 30 12 06  03 55 04 03 13 0b 43 6c  |.0.1.0...U....Cl|
+-00000350  69 65 6e 74 20 52 6f 6f  74 16 03 03 00 04 0e 00  |ient Root.......|
+-00000360  00 00                                             |..|
++000002d0  03 00 47 30 45 02 20 60  c5 bb a6 03 c0 28 bb e4  |..G0E. `.....(..|
++000002e0  42 79 a5 96 7f 50 2a 97  87 fe 6a 31 e4 80 69 eb  |By...P*...j1..i.|
++000002f0  6e 61 58 ee 6e 80 b8 02  21 00 c9 f9 91 05 bb 3e  |naX.n...!......>|
++00000300  8b 7d 4b e0 df 43 1c d5  86 62 08 d8 f0 57 ea 7c  |.}K..C...b...W.||
++00000310  e2 e7 42 93 a5 7c e9 91  d5 cd 16 03 03 00 38 0d  |..B..|........8.|
++00000320  00 00 34 01 40 00 14 08  04 04 03 08 07 08 05 08  |..4.@...........|
++00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
++00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
++00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
+ >>> Flow 3 (client to server)
+ 00000000  16 03 03 00 07 0b 00 00  03 00 00 00 16 03 03 00  |................|
+-00000010  25 10 00 00 21 20 62 21  64 7c c3 89 77 18 33 c5  |%...! b!d|..w.3.|
+-00000020  da 71 01 4e 26 c5 75 86  3d 88 b2 d4 66 6b 85 4b  |.q.N&.u.=...fk.K|
+-00000030  58 e2 41 21 26 35 14 03  03 00 01 01 16 03 03 00  |X.A!&5..........|
+-00000040  20 c3 cf c2 39 0d 26 b3  0a a0 e2 e0 f8 3b ee cc  | ...9.&......;..|
+-00000050  aa e6 4c 56 52 a8 51 d7  32 1f fa ea 43 f2 75 b3  |..LVR.Q.2...C.u.|
+-00000060  ae                                                |.|
++00000010  25 10 00 00 21 20 75 97  04 de 56 10 e6 3a e0 1c  |%...! u...V..:..|
++00000020  e5 6e 83 7e c2 88 ac f3  f7 71 b0 ba 8d a6 12 f9  |.n.~.....q......|
++00000030  6e 07 28 52 9b 0e 14 03  03 00 01 01 16 03 03 00  |n.(R............|
++00000040  20 d3 19 82 41 06 4a e7  46 36 06 d9 c5 22 60 e9  | ...A.J.F6..."`.|
++00000050  c5 70 aa 23 10 5b 1d c2  14 d9 a5 3f 22 9e 61 f5  |.p.#.[.....?".a.|
++00000060  10                                                |.|
+ >>> Flow 4 (server to client)
+-00000000  14 03 03 00 01 01 16 03  03 00 20 62 ee 6c 64 56  |.......... b.ldV|
+-00000010  72 0b 14 26 21 06 30 16  9c 9c 33 89 26 f9 cf b1  |r..&!.0...3.&...|
+-00000020  8e 10 b7 b4 3d 58 6b e8  24 94 16 17 03 03 00 1d  |....=Xk.$.......|
+-00000030  ee 05 40 52 af 66 02 73  06 37 fd 1c 9d 32 67 6d  |..@R.f.s.7...2gm|
+-00000040  1a 1c 3b c9 ac 1f d5 ab  c3 b7 c2 ef 80 15 03 03  |..;.............|
+-00000050  00 12 bb 33 94 49 94 6c  5d b4 2c d9 f7 ed ee 57  |...3.I.l].,....W|
+-00000060  18 1d d2 5e                                       |...^|
++00000000  14 03 03 00 01 01 16 03  03 00 20 b1 ab c5 7d 20  |.......... ...} |
++00000010  bd 9b ae 8e 9d cc 0b e5  3e 28 69 53 d2 cb 3b f2  |........>(iS..;.|
++00000020  73 6d 2a 86 24 72 58 60  e5 95 36 17 03 03 00 1d  |sm*.$rX`..6.....|
++00000030  af 90 36 98 b7 b5 73 1a  9c ba 61 97 16 25 91 01  |..6...s...a..%..|
++00000040  aa 05 f3 66 33 d3 0d c5  1a b4 ff d4 3e 15 03 03  |...f3.......>...|
++00000050  00 12 e5 9d 6c db 8c 66  28 a2 fd e4 f5 a2 cd c0  |....l..f(.......|
++00000060  df 6f 6d 77                                       |.omw|
+diff --git a/src/crypto/tls/tls_test.go b/src/crypto/tls/tls_test.go
+--- a/src/crypto/tls/tls_test.go
++++ b/src/crypto/tls/tls_test.go
+@@ -1883,6 +1883,8 @@ func TestPKCS1OnlyCert(t *testing.T) {
+ 	serverConfig := testConfigServer.Clone()
+ 	serverConfig.MaxVersion = VersionTLS12 // TLS 1.3 doesn't support PKCS #1 v1.5
+ 	serverConfig.ClientAuth = RequireAnyClientCert
++	// An ECDHE_RSA suite, so that the server asks for RSA certificates.
++	serverConfig.Certificates = []Certificate{testRSA2048Cert}
+ 
+ 	// If RSA-PSS is selected, the handshake should fail.
+ 	if _, _, err := testHandshake(t, clientConfig, serverConfig); err == nil {

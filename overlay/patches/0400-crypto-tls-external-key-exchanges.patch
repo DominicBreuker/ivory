@@ -1,0 +1,1070 @@
+crypto/tls: add Config.KeyExchanges for external key exchange groups
+
+The set of (EC)DHE groups in crypto/tls is closed, and unknown
+CurvePreferences entries are ignored. Products in regulated
+environments must offer groups that crypto/tls doesn't implement: TLS
+peers in the German health care network must support brainpoolP256r1
+and brainpoolP384r1 (RFC 7027), and OpenSSL servers refuse a client's
+Brainpool certificate unless the client lists a Brainpool group in
+supported_groups.
+
+Add a KeyExchange type and Config.KeyExchanges. A KeyExchange is a named
+group implemented outside crypto/tls, modeled with crypto.Encapsulator
+and crypto.Decapsulator, the interfaces crypto/tls already uses for its
+ML-KEM key shares (key_schedule.go). External groups are offered and
+accepted after the built-in groups, in slice order; CurvePreferences
+filters them like built-in groups. MinVersion and MaxVersion scope an
+entry to protocol versions, because some groups have different IDs in
+TLS 1.2 and TLS 1.3 (RFC 7027, RFC 8734). Each handshake generates a
+fresh key. An entry with the ID of a built-in group, or two entries
+with the same ID for overlapping versions, are an error. External
+groups are never used in FIPS 140-3 mode.
+
+Unlike the custom key exchanges declined in golang/go#31520, this adds
+no key exchange method and no cipher suite: only named groups inside the
+existing ECDHE (and, later, TLS 1.3 key share) flows. It exposes no
+internals of crypto/tls, and it serves regulated production use, not
+experimentation. If an exported API is not acceptable, a GOEXPERIMENT
+gate is a possible fallback.
+
+In TLS 1.3, external groups are key share groups, modeled the same way
+as ML-KEM: the client generates the key and the server encapsulates. A
+client sends a key share for its first group, which is an external
+group when CurvePreferences lists only external groups (as for servers
+that accept only Brainpool groups, RFC 8734), and a server may select an
+external group in a HelloRetryRequest. A client that offers TLS 1.2 and
+TLS 1.3 lists the groups limited to TLS 1.2 after the others; if it has
+no group for TLS 1.3, it offers only TLS 1.2 (Config.supportedVersions,
+so that the downgrade check agrees), instead of failing with "no
+supported key exchange methods". A HelloRetryRequest that selects a
+group the client offered only for TLS 1.2 draws illegal_parameter. An
+invalid key share fails as for the built-in groups.
+
+The tests wrap crypto/ecdh's P-256 and X25519 as KEMs under private-use
+group IDs (RFC 8446 reserves 0xFE00-0xFEFF).
+
+ivory: P4, profiles core and kt. Base: go1.27.2 with P0-P3.
+Upstream: proposal C. Requirements: GS-A_4384-03, A_17094-02, A_23912,
+A_23913 (gemSpec_Krypt V2.51.0).
+Status: TLS 1.2 and TLS 1.3.
+
+diff --git a/src/crypto/tls/common.go b/src/crypto/tls/common.go
+--- a/src/crypto/tls/common.go
++++ b/src/crypto/tls/common.go
+@@ -843,6 +843,21 @@ type Config struct {
+ 	// GODEBUG=tlsmlkem=0 or the GODEBUG=tlssecpmlkem=0 environment variable.
+ 	CurvePreferences []CurveID
+ 
++	// KeyExchanges are additional key exchange groups, implemented outside
++	// this package. They are offered and accepted after the built-in
++	// groups, in slice order. If CurvePreferences is not empty, only those
++	// listed in it are used.
++	//
++	// A TLS 1.3 client sends a key share for its first group, which is an
++	// external group if CurvePreferences lists no built-in group, and a
++	// server may ask for one with a HelloRetryRequest. A client that offers
++	// TLS 1.2 and TLS 1.3 lists the groups for TLS 1.2 only after the
++	// others, and doesn't offer TLS 1.3 if it has no group for it. They
++	// are never used in FIPS 140-3 mode. It is an error if an entry's ID is
++	// a built-in group, or if two entries have the same ID for overlapping
++	// versions.
++	KeyExchanges []KeyExchange
++
+ 	// DynamicRecordSizingDisabled disables adaptive sizing of TLS records.
+ 	// When true, the largest possible TLS record size is always used. When
+ 	// false, the size of TLS records may be adjusted in an attempt to
+@@ -1063,6 +1078,7 @@ func (c *Config) Clone() *Config {
+ 		MinVersion:                          c.MinVersion,
+ 		MaxVersion:                          c.MaxVersion,
+ 		CurvePreferences:                    c.CurvePreferences,
++		KeyExchanges:                        c.KeyExchanges,
+ 		DynamicRecordSizingDisabled:         c.DynamicRecordSizingDisabled,
+ 		Renegotiation:                       c.Renegotiation,
+ 		KeyLogWriter:                        c.KeyLogWriter,
+@@ -1277,6 +1293,12 @@ func (c *Config) supportedVersions(isClient, isQUIC bool) []uint16 {
+ 		}
+ 		versions = append(versions, v)
+ 	}
++	// Built-in groups work in TLS 1.2 and TLS 1.3, but KeyExchanges may be
++	// limited to TLS 1.2. A client doesn't offer TLS 1.3 without a group.
++	if isClient && c != nil && len(c.KeyExchanges) != 0 && len(versions) > 1 && versions[0] == VersionTLS13 &&
++		len(c.curvePreferences(VersionTLS13)) == 0 && len(c.curvePreferences(VersionTLS12)) != 0 {
++		versions = versions[1:]
++	}
+ 	return versions
+ }
+ 
+@@ -1302,6 +1324,75 @@ func supportedVersionsFromMax(maxVersion uint16) []uint16 {
+ 	return versions
+ }
+ 
++// A KeyExchange is a key exchange group implemented outside this package,
++// for use in [Config.KeyExchanges]. It is used as an (EC)DHE group in
++// TLS 1.2 and as a key share group in TLS 1.3, modeled as a KEM: the side
++// that sends first (the server in TLS 1.2, the client in TLS 1.3) calls
++// GenerateKey and sends Encapsulator().Bytes(); the peer passes those bytes
++// to NewEncapsulator, calls Encapsulate and sends the ciphertext; the first
++// side calls Decapsulate. For elliptic curve Diffie-Hellman, the
++// encapsulation key and the ciphertext are the two ephemeral public keys,
++// and the shared key is the x-coordinate of the shared point, big-endian,
++// padded to the field size (RFC 8422, Section 5.10; RFC 8446,
++// Section 7.4.2).
++type KeyExchange struct {
++	ID CurveID
++
++	// MinVersion and MaxVersion limit the protocol versions for which ID
++	// is offered and accepted. Zero means no limit.
++	MinVersion, MaxVersion uint16
++
++	// GenerateKey returns a new ephemeral key for one handshake.
++	GenerateKey func() (crypto.Decapsulator, error)
++
++	// NewEncapsulator parses and validates the peer's encapsulation key.
++	NewEncapsulator func(encapsulationKey []byte) (crypto.Encapsulator, error)
++}
++
++// keyExchange returns the entry of c.KeyExchanges for id that may be used
++// at version, or nil.
++func (c *Config) keyExchange(version uint16, id CurveID) *KeyExchange {
++	if c == nil || len(c.KeyExchanges) == 0 ||
++		fips140tls.Required() || slices.Contains(curvePreferenceOrder(), id) {
++		return nil
++	}
++	for i := range c.KeyExchanges {
++		ke := &c.KeyExchanges[i]
++		if ke.ID == id && (ke.MinVersion == 0 || version >= ke.MinVersion) &&
++			(ke.MaxVersion == 0 || version <= ke.MaxVersion) {
++			return ke
++		}
++	}
++	return nil
++}
++
++// checkKeyExchanges reports an error if c.KeyExchanges is invalid.
++func (c *Config) checkKeyExchanges() error {
++	versions := func(ke KeyExchange) (lo, hi uint16) {
++		lo, hi = ke.MinVersion, ke.MaxVersion
++		if hi == 0 {
++			hi = 0xffff
++		}
++		return lo, hi
++	}
++	for i, ke := range c.KeyExchanges {
++		if slices.Contains(curvePreferenceOrder(), ke.ID) {
++			return fmt.Errorf("tls: KeyExchanges entry for built-in group %v", ke.ID)
++		}
++		if ke.GenerateKey == nil || ke.NewEncapsulator == nil {
++			return fmt.Errorf("tls: KeyExchanges entry for %v has nil functions", ke.ID)
++		}
++		lo, hi := versions(ke)
++		for _, prev := range c.KeyExchanges[:i] {
++			prevLo, prevHi := versions(prev)
++			if prev.ID == ke.ID && max(lo, prevLo) <= min(hi, prevHi) {
++				return fmt.Errorf("tls: KeyExchanges has two entries for %v with overlapping versions", ke.ID)
++			}
++		}
++	}
++	return nil
++}
++
+ // supportsUnsupportedPeerKey reports whether a peer certificate whose public
+ // key this package doesn't support may be used in a connection of version
+ // vers, with VerifyUnsupportedSignature.
+@@ -1310,12 +1401,23 @@ func (c *Config) supportsUnsupportedPeerKey(vers uint16) bool {
+ }
+ 
+ func (c *Config) curvePreferences(version uint16) []CurveID {
+-	return slices.DeleteFunc(curvePreferenceOrder(), func(x CurveID) bool {
++	order := curvePreferenceOrder()
++	if c != nil {
++		for _, ke := range c.KeyExchanges {
++			if !slices.Contains(order, ke.ID) {
++				order = append(order, ke.ID)
++			}
++		}
++	}
++	return slices.DeleteFunc(order, func(x CurveID) bool {
+ 		return !c.supportsCurve(version, x)
+ 	})
+ }
+ 
+ func (c *Config) supportsCurve(version uint16, x CurveID) bool {
++	if c.keyExchange(version, x) != nil {
++		return len(c.CurvePreferences) == 0 || slices.Contains(c.CurvePreferences, x)
++	}
+ 	if c != nil && len(c.CurvePreferences) != 0 {
+ 		if !slices.Contains(c.CurvePreferences, x) {
+ 			return false
+diff --git a/src/crypto/tls/handshake_client.go b/src/crypto/tls/handshake_client.go
+--- a/src/crypto/tls/handshake_client.go
++++ b/src/crypto/tls/handshake_client.go
+@@ -59,6 +59,10 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
+ 		return nil, nil, nil, errors.New("tls: NextProtos values too large")
+ 	}
+ 
++	if err := config.checkKeyExchanges(); err != nil {
++		return nil, nil, nil, err
++	}
++
+ 	supportedVersions := config.supportedVersions(roleClient, c.quic != nil)
+ 	if len(supportedVersions) == 0 {
+ 		return nil, nil, nil, errors.New("tls: no supported versions satisfy MinVersion and MaxVersion")
+@@ -146,7 +150,7 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
+ 		// key share for. All the PQ hybrids sort first, and produce a fallback
+ 		// ECDH share.
+ 		curveID := hello.supportedCurves[0]
+-		ke, err := keyExchangeForCurveID(curveID)
++		ke, err := config.keyExchangeForCurveID(curveID)
+ 		if err != nil {
+ 			return nil, nil, nil, errors.New("tls: internal error: supportsCurve accepted unimplemented curve")
+ 		}
+@@ -158,6 +162,16 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
+ 		if len(hello.keyShares) == 2 && !slices.Contains(hello.supportedCurves, hello.keyShares[1].group) {
+ 			hello.keyShares = hello.keyShares[:1]
+ 		}
++
++		// Config.KeyExchanges may be limited to TLS 1.2. Offer those after
++		// the TLS 1.3 groups.
++		if minVersion <= VersionTLS12 {
++			for _, id := range config.curvePreferences(VersionTLS12) {
++				if !slices.Contains(hello.supportedCurves, id) {
++					hello.supportedCurves = append(hello.supportedCurves, id)
++				}
++			}
++		}
+ 	}
+ 
+ 	if c.quic != nil {
+diff --git a/src/crypto/tls/handshake_client_tls13.go b/src/crypto/tls/handshake_client_tls13.go
+--- a/src/crypto/tls/handshake_client_tls13.go
++++ b/src/crypto/tls/handshake_client_tls13.go
+@@ -54,7 +54,7 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
+ 	}
+ 
+ 	// Consistency check on the presence of a keyShare and its parameters.
+-	if hs.keyShareKeys == nil || (hs.keyShareKeys.ecdhe == nil && hs.keyShareKeys.mlkem == nil) ||
++	if hs.keyShareKeys == nil || (hs.keyShareKeys.ecdhe == nil && hs.keyShareKeys.mlkem == nil && hs.keyShareKeys.external == nil) ||
+ 		len(hs.hello.keyShares) == 0 {
+ 		return c.sendAlert(alertInternalError)
+ 	}
+@@ -310,7 +310,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
+ 	// a group we advertised but did not send a key share for, and send a key
+ 	// share for it this time.
+ 	if curveID := hs.serverHello.selectedGroup; curveID != 0 {
+-		if !slices.Contains(hello.supportedCurves, curveID) {
++		if !slices.Contains(hello.supportedCurves, curveID) || !c.config.supportsCurve(VersionTLS13, curveID) {
+ 			c.sendAlert(alertIllegalParameter)
+ 			return errors.New("tls: server selected unsupported group")
+ 		}
+@@ -320,7 +320,7 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
+ 			c.sendAlert(alertIllegalParameter)
+ 			return errors.New("tls: server sent an unnecessary HelloRetryRequest key_share")
+ 		}
+-		ke, err := keyExchangeForCurveID(curveID)
++		ke, err := c.config.keyExchangeForCurveID(curveID)
+ 		if err != nil {
+ 			c.sendAlert(alertInternalError)
+ 			return errors.New("tls: internal error: supportsCurve accepted unimplemented curve")
+@@ -471,7 +471,7 @@ func (hs *clientHandshakeStateTLS13) processServerHello() error {
+ func (hs *clientHandshakeStateTLS13) establishHandshakeKeys() error {
+ 	c := hs.c
+ 
+-	ke, err := keyExchangeForCurveID(hs.serverHello.serverShare.group)
++	ke, err := c.config.keyExchangeForCurveID(hs.serverHello.serverShare.group)
+ 	if err != nil {
+ 		c.sendAlert(alertInternalError)
+ 		return err
+diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_server.go
+--- a/src/crypto/tls/handshake_server.go
++++ b/src/crypto/tls/handshake_server.go
+@@ -175,6 +175,10 @@ func (c *Conn) readClientHello(ctx context.Context) (*clientHelloMsg, *echServer
+ 		}
+ 	}
+ 	c.ticketKeys = originalConfig.ticketKeys(configForClient)
++	if err := c.config.checkKeyExchanges(); err != nil {
++		c.sendAlert(alertInternalError)
++		return nil, nil, err
++	}
+ 
+ 	clientVersions := clientHello.supportedVersions
+ 	if clientHello.vers >= VersionTLS13 && len(clientVersions) == 0 {
+diff --git a/src/crypto/tls/handshake_server_tls13.go b/src/crypto/tls/handshake_server_tls13.go
+--- a/src/crypto/tls/handshake_server_tls13.go
++++ b/src/crypto/tls/handshake_server_tls13.go
+@@ -246,7 +246,7 @@ func (hs *serverHandshakeStateTLS13) processClientHello() error {
+ 	}
+ 	c.curveID = selectedGroup
+ 
+-	ke, err := keyExchangeForCurveID(selectedGroup)
++	ke, err := c.config.keyExchangeForCurveID(selectedGroup)
+ 	if err != nil {
+ 		c.sendAlert(alertInternalError)
+ 		return errors.New("tls: internal error: supportsCurve accepted unimplemented curve")
+diff --git a/src/crypto/tls/key_agreement.go b/src/crypto/tls/key_agreement.go
+--- a/src/crypto/tls/key_agreement.go
++++ b/src/crypto/tls/key_agreement.go
+@@ -153,6 +153,7 @@ type ecdheKeyAgreement struct {
+ 	curveID            CurveID
+ 	signatureAlgorithm SignatureScheme
+ 	key                *ecdh.PrivateKey
++	externalKey        crypto.Decapsulator // for Config.KeyExchanges
+ }
+ 
+ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Certificate, clientHello *clientHelloMsg, hello *serverHelloMsg) (*serverKeyExchangeMsg, error) {
+@@ -166,18 +167,30 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
+ 	if ka.curveID == 0 {
+ 		return nil, errors.New("tls: no supported elliptic curves offered")
+ 	}
+-	if _, ok := curveForCurveID(ka.curveID); !ok {
+-		return nil, errors.New("tls: internal error: supportsCurve accepted unimplemented curve")
+-	}
+-
+-	key, err := generateECDHEKey(config.rand(), ka.curveID)
+-	if err != nil {
+-		return nil, err
++	var ecdhePublic []byte
++	if ke := config.keyExchange(ka.version, ka.curveID); ke != nil {
++		key, err := ke.GenerateKey()
++		if err != nil {
++			return nil, err
++		}
++		ka.externalKey = key
++		ecdhePublic = key.Encapsulator().Bytes()
++		if len(ecdhePublic) > 255 {
++			return nil, errors.New("tls: KeyExchanges encapsulation key too long")
++		}
++	} else {
++		if _, ok := curveForCurveID(ka.curveID); !ok {
++			return nil, errors.New("tls: internal error: supportsCurve accepted unimplemented curve")
++		}
++		key, err := generateECDHEKey(config.rand(), ka.curveID)
++		if err != nil {
++			return nil, err
++		}
++		ka.key = key
++		ecdhePublic = key.PublicKey().Bytes()
+ 	}
+-	ka.key = key
+ 
+ 	// See RFC 4492, Section 5.4.
+-	ecdhePublic := key.PublicKey().Bytes()
+ 	serverECDHEParams := make([]byte, 1+2+1+len(ecdhePublic))
+ 	serverECDHEParams[0] = 3 // named curve
+ 	serverECDHEParams[1] = byte(ka.curveID >> 8)
+@@ -191,6 +204,7 @@ func (ka *ecdheKeyAgreement) generateServerKeyExchange(config *Config, cert *Cer
+ 	}
+ 
+ 	var sig []byte
++	var err error
+ 	if ka.version >= VersionTLS12 {
+ 		ka.signatureAlgorithm, err = selectSignatureScheme(ka.version, cert, clientHello.supportedSignatureAlgorithms)
+ 		if err != nil {
+@@ -256,6 +270,14 @@ func (ka *ecdheKeyAgreement) processClientKeyExchange(config *Config, cert *Cert
+ 		return nil, errClientKeyExchange
+ 	}
+ 
++	if ka.externalKey != nil {
++		preMasterSecret, err := ka.externalKey.Decapsulate(ckx.ciphertext[1:])
++		if err != nil {
++			return nil, errClientKeyExchange
++		}
++		return preMasterSecret, nil
++	}
++
+ 	peerKey, err := ka.key.Curve().NewPublicKey(ckx.ciphertext[1:])
+ 	if err != nil {
+ 		return nil, errClientKeyExchange
+@@ -309,26 +331,38 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
+ 		return errors.New("tls: server selected unoffered curve")
+ 	}
+ 
+-	if _, ok := curveForCurveID(ka.curveID); !ok {
+-		return errors.New("tls: server selected unsupported curve")
+-	}
++	var ourPublicKey []byte
++	if ke := config.keyExchange(ka.version, ka.curveID); ke != nil {
++		encapsulator, err := ke.NewEncapsulator(publicKey)
++		if err != nil {
++			return errServerKeyExchange
++		}
++		ka.preMasterSecret, ourPublicKey = encapsulator.Encapsulate()
++		if len(ourPublicKey) > 255 {
++			return errors.New("tls: KeyExchanges ciphertext too long")
++		}
++	} else {
++		if _, ok := curveForCurveID(ka.curveID); !ok {
++			return errors.New("tls: server selected unsupported curve")
++		}
+ 
+-	key, err := generateECDHEKey(config.rand(), ka.curveID)
+-	if err != nil {
+-		return err
+-	}
+-	ka.key = key
++		key, err := generateECDHEKey(config.rand(), ka.curveID)
++		if err != nil {
++			return err
++		}
++		ka.key = key
+ 
+-	peerKey, err := key.Curve().NewPublicKey(publicKey)
+-	if err != nil {
+-		return errServerKeyExchange
+-	}
+-	ka.preMasterSecret, err = key.ECDH(peerKey)
+-	if err != nil {
+-		return errServerKeyExchange
+-	}
++		peerKey, err := key.Curve().NewPublicKey(publicKey)
++		if err != nil {
++			return errServerKeyExchange
++		}
++		ka.preMasterSecret, err = key.ECDH(peerKey)
++		if err != nil {
++			return errServerKeyExchange
++		}
+ 
+-	ourPublicKey := key.PublicKey().Bytes()
++		ourPublicKey = key.PublicKey().Bytes()
++	}
+ 	ka.ckx = new(clientKeyExchangeMsg)
+ 	ka.ckx.ciphertext = make([]byte, 1+len(ourPublicKey))
+ 	ka.ckx.ciphertext[0] = byte(len(ourPublicKey))
+@@ -336,6 +370,7 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
+ 
+ 	var sigType uint8
+ 	var sigHash crypto.Hash
++	var err error
+ 	if ka.version >= VersionTLS12 {
+ 		if !isSupportedSignatureAlgorithm(ka.signatureAlgorithm, clientHello.supportedSignatureAlgorithms) {
+ 			return errors.New("tls: certificate used with invalid signature algorithm")
+diff --git a/src/crypto/tls/key_exchange_test.go b/src/crypto/tls/key_exchange_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/tls/key_exchange_test.go
+@@ -0,0 +1,553 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"crypto"
++	"crypto/ecdh"
++	"crypto/rand"
++	"errors"
++	"slices"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++// Private-use group IDs (RFC 8446, Section 4.2.7) for the test KEMs.
++const (
++	testGroupP256   CurveID = 0xFE01
++	testGroupX25519 CurveID = 0xFE02
++)
++
++// ecdhDecapsulator and ecdhEncapsulator model (EC)DH as a KEM, as
++// KeyExchange describes: the ciphertext is the peer's ephemeral public key.
++type ecdhDecapsulator struct{ key *ecdh.PrivateKey }
++
++func (d ecdhDecapsulator) Encapsulator() crypto.Encapsulator {
++	return ecdhEncapsulator{d.key.PublicKey()}
++}
++
++func (d ecdhDecapsulator) Decapsulate(ciphertext []byte) ([]byte, error) {
++	peer, err := d.key.Curve().NewPublicKey(ciphertext)
++	if err != nil {
++		return nil, err
++	}
++	return d.key.ECDH(peer)
++}
++
++type ecdhEncapsulator struct{ pub *ecdh.PublicKey }
++
++func (e ecdhEncapsulator) Bytes() []byte { return e.pub.Bytes() }
++
++func (e ecdhEncapsulator) Encapsulate() (sharedKey, ciphertext []byte) {
++	key, err := e.pub.Curve().GenerateKey(rand.Reader)
++	if err != nil {
++		panic(err)
++	}
++	sharedKey, err = key.ECDH(e.pub)
++	if err != nil {
++		panic(err)
++	}
++	return sharedKey, key.PublicKey().Bytes()
++}
++
++// testKEM is a KeyExchange for id, implemented with curve, that counts how
++// often it is used.
++type testKEM struct {
++	generated, encapsulated atomic.Int32
++}
++
++func (k *testKEM) keyExchange(id CurveID, curve ecdh.Curve) KeyExchange {
++	return KeyExchange{
++		ID: id,
++		GenerateKey: func() (crypto.Decapsulator, error) {
++			k.generated.Add(1)
++			key, err := curve.GenerateKey(rand.Reader)
++			if err != nil {
++				return nil, err
++			}
++			return ecdhDecapsulator{key}, nil
++		},
++		NewEncapsulator: func(encapsulationKey []byte) (crypto.Encapsulator, error) {
++			k.encapsulated.Add(1)
++			pub, err := curve.NewPublicKey(encapsulationKey)
++			if err != nil {
++				return nil, err
++			}
++			return ecdhEncapsulator{pub}, nil
++		},
++	}
++}
++
++// recordClientHello makes config record the supported_groups of the
++// ClientHellos it receives.
++func recordClientHello(config *Config) *[]CurveID {
++	var groups []CurveID
++	config.GetConfigForClient = func(chi *ClientHelloInfo) (*Config, error) {
++		groups = slices.Clone(chi.SupportedCurves)
++		return nil, nil
++	}
++	return &groups
++}
++
++func TestKeyExchangeTLS12(t *testing.T) {
++	var kem testKEM
++	ke := kem.keyExchange(testGroupP256, ecdh.P256())
++	clientConfig := testConfigClient.Clone()
++	clientConfig.MaxVersion = VersionTLS12
++	clientConfig.KeyExchanges = []KeyExchange{ke}
++	clientConfig.CurvePreferences = []CurveID{testGroupP256}
++	serverConfig := testConfigServer.Clone()
++	serverConfig.KeyExchanges = []KeyExchange{ke}
++	serverConfig.CurvePreferences = []CurveID{testGroupP256}
++	groups := recordClientHello(serverConfig)
++
++	ss, cs, err := testHandshake(t, clientConfig, serverConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if ss.CurveID != testGroupP256 || cs.CurveID != testGroupP256 {
++		t.Errorf("CurveID = %v (server), %v (client); want %v", ss.CurveID, cs.CurveID, testGroupP256)
++	}
++	if !slices.Equal(*groups, []CurveID{testGroupP256}) {
++		t.Errorf("supported_groups = %v, want [%v]", *groups, testGroupP256)
++	}
++	if g, e := kem.generated.Load(), kem.encapsulated.Load(); g != 1 || e != 1 {
++		t.Errorf("GenerateKey ran %d times, NewEncapsulator %d times; want 1, 1", g, e)
++	}
++
++	// Each handshake uses a fresh key.
++	if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++		t.Fatal(err)
++	}
++	if g := kem.generated.Load(); g != 2 {
++		t.Errorf("GenerateKey ran %d times after two handshakes, want 2", g)
++	}
++}
++
++func TestKeyExchangeOrder(t *testing.T) {
++	var kem testKEM
++	ke := kem.keyExchange(testGroupP256, ecdh.P256())
++
++	t.Run("after built-in groups", func(t *testing.T) {
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.KeyExchanges = []KeyExchange{ke}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = []KeyExchange{ke}
++		groups := recordClientHello(serverConfig)
++		ss, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		want := []CurveID{X25519, CurveP256, CurveP384, CurveP521, testGroupP256}
++		if !slices.Equal(*groups, want) {
++			t.Errorf("supported_groups = %v, want %v", *groups, want)
++		}
++		if ss.CurveID != X25519 {
++			t.Errorf("CurveID = %v, want X25519", ss.CurveID)
++		}
++	})
++
++	t.Run("CurvePreferences filters", func(t *testing.T) {
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.KeyExchanges = []KeyExchange{ke}
++		// CurvePreferences doesn't change the order.
++		clientConfig.CurvePreferences = []CurveID{testGroupP256, CurveP384}
++		serverConfig := testConfigServer.Clone()
++		groups := recordClientHello(serverConfig)
++		if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++			t.Fatal(err)
++		}
++		if want := []CurveID{CurveP384, testGroupP256}; !slices.Equal(*groups, want) {
++			t.Errorf("supported_groups = %v, want %v", *groups, want)
++		}
++	})
++
++	t.Run("server", func(t *testing.T) {
++		// The server picks the first group of the client that it supports.
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.KeyExchanges = []KeyExchange{ke}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = []KeyExchange{ke}
++		serverConfig.CurvePreferences = []CurveID{CurveP521, testGroupP256}
++		ss, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ss.CurveID != CurveP521 {
++			t.Errorf("CurveID = %v, want P-521", ss.CurveID)
++		}
++	})
++
++	t.Run("not configured", func(t *testing.T) {
++		// A group in CurvePreferences without a KeyExchange is ignored.
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.CurvePreferences = []CurveID{testGroupP256, CurveP256}
++		serverConfig := testConfigServer.Clone()
++		groups := recordClientHello(serverConfig)
++		if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++			t.Fatal(err)
++		}
++		if want := []CurveID{CurveP256}; !slices.Equal(*groups, want) {
++			t.Errorf("supported_groups = %v, want %v", *groups, want)
++		}
++	})
++}
++
++func TestKeyExchangeVersions(t *testing.T) {
++	var kem12, kem13 testKEM
++	ke12 := kem12.keyExchange(testGroupP256, ecdh.P256())
++	ke12.MaxVersion = VersionTLS12
++	ke13 := kem13.keyExchange(testGroupX25519, ecdh.X25519())
++	ke13.MinVersion = VersionTLS13
++	kes := []KeyExchange{ke12, ke13}
++
++	t.Run("TLS 1.2", func(t *testing.T) {
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.KeyExchanges = kes
++		clientConfig.CurvePreferences = []CurveID{testGroupP256, testGroupX25519}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = kes
++		groups := recordClientHello(serverConfig)
++		ss, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if want := []CurveID{testGroupP256}; !slices.Equal(*groups, want) {
++			t.Errorf("supported_groups = %v, want %v", *groups, want)
++		}
++		if ss.CurveID != testGroupP256 {
++			t.Errorf("CurveID = %v, want %v", ss.CurveID, testGroupP256)
++		}
++	})
++
++	t.Run("TLS 1.2 server, TLS 1.3 group", func(t *testing.T) {
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.KeyExchanges = kes
++		clientConfig.CurvePreferences = []CurveID{testGroupP256}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = kes
++		serverConfig.CurvePreferences = []CurveID{testGroupX25519}
++		if _, _, err := testHandshake(t, clientConfig, serverConfig); err == nil {
++			t.Fatal("handshake succeeded without a common TLS 1.2 group")
++		}
++		if n := kem13.generated.Load() + kem13.encapsulated.Load(); n != 0 {
++			t.Errorf("the TLS 1.3 group was used %d times in TLS 1.2", n)
++		}
++	})
++
++	t.Run("client offers TLS 1.2 and 1.3", func(t *testing.T) {
++		// Both groups are offered, the TLS 1.2 group after the TLS 1.3
++		// group, and a server that negotiates TLS 1.2 uses the TLS 1.2
++		// group.
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = kes
++		serverConfig := testConfigServer.Clone()
++		serverConfig.MaxVersion = VersionTLS12
++		serverConfig.KeyExchanges = kes
++		serverConfig.CurvePreferences = []CurveID{testGroupP256}
++		groups := recordClientHello(serverConfig)
++		ss, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ss.Version != VersionTLS12 || ss.CurveID != testGroupP256 {
++			t.Errorf("Version, CurveID = %x, %v; want TLS 1.2, %v", ss.Version, ss.CurveID, testGroupP256)
++		}
++		if n := len(*groups); n < 2 || (*groups)[n-2] != testGroupX25519 || (*groups)[n-1] != testGroupP256 {
++			t.Errorf("supported_groups = %v, want %v and %v last", *groups, testGroupX25519, testGroupP256)
++		}
++	})
++
++	t.Run("TLS 1.3", func(t *testing.T) {
++		// Built-in groups come first.
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = kes
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = kes
++		ss, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ss.Version != VersionTLS13 || ss.CurveID == testGroupP256 || ss.CurveID == testGroupX25519 {
++			t.Errorf("Version, CurveID = %x, %v; want TLS 1.3 with a built-in group", ss.Version, ss.CurveID)
++		}
++	})
++
++	t.Run("TLS 1.3 server, TLS 1.2 group", func(t *testing.T) {
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = kes
++		clientConfig.CurvePreferences = []CurveID{testGroupP256, testGroupX25519}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = kes
++		serverConfig.CurvePreferences = []CurveID{testGroupP256}
++		_, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err == nil || !strings.Contains(err.Error(), "no key exchanges supported") {
++			t.Errorf("err = %v, want no common TLS 1.3 group", err)
++		}
++	})
++
++	t.Run("only TLS 1.2 groups", func(t *testing.T) {
++		// A client without a TLS 1.3 group doesn't offer TLS 1.3.
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = kes
++		clientConfig.CurvePreferences = []CurveID{testGroupP256}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = kes
++		ss, _, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ss.Version != VersionTLS12 || ss.CurveID != testGroupP256 {
++			t.Errorf("Version, CurveID = %x, %v; want TLS 1.2, %v", ss.Version, ss.CurveID, testGroupP256)
++		}
++	})
++}
++
++func TestKeyExchangeTLS13(t *testing.T) {
++	t.Run("key share", func(t *testing.T) {
++		// A client whose CurvePreferences lists only external groups
++		// sends a key share for the first one.
++		var kem testKEM
++		ke := kem.keyExchange(testGroupP256, ecdh.P256())
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = []KeyExchange{ke}
++		clientConfig.CurvePreferences = []CurveID{testGroupP256}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = []KeyExchange{ke}
++		ss, cs, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ss.Version != VersionTLS13 || ss.CurveID != testGroupP256 || cs.CurveID != testGroupP256 {
++			t.Errorf("Version, CurveID = %x, %v (server), %v (client); want TLS 1.3, %v", ss.Version, ss.CurveID, cs.CurveID, testGroupP256)
++		}
++		if ss.HelloRetryRequest || cs.HelloRetryRequest {
++			t.Error("unexpected HelloRetryRequest")
++		}
++		if g, e := kem.generated.Load(), kem.encapsulated.Load(); g != 1 || e != 1 {
++			t.Errorf("GenerateKey ran %d times, NewEncapsulator %d times; want 1, 1", g, e)
++		}
++		// Each handshake uses a fresh key.
++		if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++			t.Fatal(err)
++		}
++		if g := kem.generated.Load(); g != 2 {
++			t.Errorf("GenerateKey ran %d times after two handshakes, want 2", g)
++		}
++	})
++
++	t.Run("HelloRetryRequest", func(t *testing.T) {
++		// The client sends a key share for a built-in group; the server
++		// accepts only the external group and asks for it.
++		var kem testKEM
++		ke := kem.keyExchange(testGroupX25519, ecdh.X25519())
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = []KeyExchange{ke}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = []KeyExchange{ke}
++		serverConfig.CurvePreferences = []CurveID{testGroupX25519}
++		ss, cs, err := testHandshake(t, clientConfig, serverConfig)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if ss.CurveID != testGroupX25519 || cs.CurveID != testGroupX25519 {
++			t.Errorf("CurveID = %v (server), %v (client); want %v", ss.CurveID, cs.CurveID, testGroupX25519)
++		}
++		if !ss.HelloRetryRequest || !cs.HelloRetryRequest {
++			t.Error("no HelloRetryRequest")
++		}
++		if g, e := kem.generated.Load(), kem.encapsulated.Load(); g != 1 || e != 1 {
++			t.Errorf("GenerateKey ran %d times, NewEncapsulator %d times; want 1, 1", g, e)
++		}
++	})
++
++	t.Run("HelloRetryRequest for a TLS 1.2 group", func(t *testing.T) {
++		// A server that selects a group the client offered only for
++		// TLS 1.2 gets illegal_parameter. The server here is wrong to
++		// use the group in TLS 1.3.
++		var kem testKEM
++		ke := kem.keyExchange(testGroupP256, ecdh.P256())
++		ke12 := ke
++		ke12.MaxVersion = VersionTLS12
++		clientConfig := testConfigClient.Clone()
++		clientConfig.KeyExchanges = []KeyExchange{ke12}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.KeyExchanges = []KeyExchange{ke}
++		serverConfig.CurvePreferences = []CurveID{testGroupP256}
++		clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++		if clientErr == nil || !strings.Contains(clientErr.Error(), "server selected unsupported group") {
++			t.Errorf("client error = %v, want an unsupported group error", clientErr)
++		}
++		if serverErr == nil || !strings.Contains(serverErr.Error(), "illegal parameter") {
++			t.Errorf("server error = %v, want an illegal_parameter alert", serverErr)
++		}
++	})
++}
++
++func TestKeyExchangeInvalidTLS13(t *testing.T) {
++	var kem testKEM
++	good := kem.keyExchange(testGroupP256, ecdh.P256())
++	failing := good
++	failing.NewEncapsulator = func([]byte) (crypto.Encapsulator, error) {
++		return nil, errors.New("invalid encapsulation key")
++	}
++	failing.GenerateKey = func() (crypto.Decapsulator, error) {
++		key, err := ecdh.P256().GenerateKey(rand.Reader)
++		if err != nil {
++			return nil, err
++		}
++		return failingDecapsulator{ecdhDecapsulator{key}}, nil
++	}
++	for _, tt := range []struct {
++		name           string
++		client, server KeyExchange
++		clientErr      string
++		serverErr      string
++	}{
++		{"client share", good, failing, "illegal parameter", "invalid client key share"},
++		// The server reads the client's alert as a record that fails to
++		// decrypt, as for built-in groups.
++		{"server share", failing, good, "invalid server key share", ""},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			clientConfig := testConfigClient.Clone()
++			clientConfig.KeyExchanges = []KeyExchange{tt.client}
++			clientConfig.CurvePreferences = []CurveID{testGroupP256}
++			serverConfig := testConfigServer.Clone()
++			serverConfig.KeyExchanges = []KeyExchange{tt.server}
++			clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++			if clientErr == nil || !strings.Contains(clientErr.Error(), tt.clientErr) {
++				t.Errorf("client error = %v, want %q", clientErr, tt.clientErr)
++			}
++			if serverErr == nil || !strings.Contains(serverErr.Error(), tt.serverErr) {
++				t.Errorf("server error = %v, want %q", serverErr, tt.serverErr)
++			}
++		})
++	}
++}
++
++func TestKeyExchangeInvalid(t *testing.T) {
++	var kem testKEM
++	good := kem.keyExchange(testGroupP256, ecdh.P256())
++	failing := good
++	failing.NewEncapsulator = func([]byte) (crypto.Encapsulator, error) {
++		return nil, errors.New("invalid encapsulation key")
++	}
++	failing.GenerateKey = func() (crypto.Decapsulator, error) {
++		key, err := ecdh.P256().GenerateKey(rand.Reader)
++		if err != nil {
++			return nil, err
++		}
++		return failingDecapsulator{ecdhDecapsulator{key}}, nil
++	}
++
++	for _, tt := range []struct {
++		name           string
++		client, server KeyExchange
++		wantErr        string
++	}{
++		{"server share", failing, good, "illegal parameter"},
++		{"client share", good, failing, "illegal parameter"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MaxVersion = VersionTLS12
++			clientConfig.KeyExchanges = []KeyExchange{tt.client}
++			clientConfig.CurvePreferences = []CurveID{testGroupP256}
++			serverConfig := testConfigServer.Clone()
++			serverConfig.KeyExchanges = []KeyExchange{tt.server}
++			_, _, err := testHandshake(t, clientConfig, serverConfig)
++			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
++				t.Errorf("err = %v, want %q", err, tt.wantErr)
++			}
++		})
++	}
++}
++
++type failingDecapsulator struct{ ecdhDecapsulator }
++
++func (failingDecapsulator) Decapsulate([]byte) ([]byte, error) {
++	return nil, errors.New("invalid ciphertext")
++}
++
++func TestKeyExchangeBuiltinID(t *testing.T) {
++	var kem testKEM
++	ke := kem.keyExchange(CurveP256, ecdh.P256())
++	for _, side := range []string{"client", "server"} {
++		t.Run(side, func(t *testing.T) {
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MaxVersion = VersionTLS12
++			serverConfig := testConfigServer.Clone()
++			if side == "client" {
++				clientConfig.KeyExchanges = []KeyExchange{ke}
++			} else {
++				serverConfig.KeyExchanges = []KeyExchange{ke}
++			}
++			_, _, err := testHandshake(t, clientConfig, serverConfig)
++			if err == nil || !strings.Contains(err.Error(), "KeyExchanges") {
++				t.Errorf("err = %v, want an error about KeyExchanges", err)
++			}
++		})
++	}
++	if n := kem.generated.Load() + kem.encapsulated.Load(); n != 0 {
++		t.Errorf("a KeyExchange with a built-in ID was used %d times", n)
++	}
++}
++
++func TestKeyExchangeFIPS(t *testing.T) {
++	var kem testKEM
++	ke := kem.keyExchange(testGroupP256, ecdh.P256())
++	runWithFIPSEnabled(t, func(t *testing.T) {
++		config := &Config{
++			KeyExchanges:     []KeyExchange{ke},
++			CurvePreferences: []CurveID{CurveP256, testGroupP256},
++		}
++		if got, want := config.curvePreferences(VersionTLS12), []CurveID{CurveP256}; !slices.Equal(got, want) {
++			t.Errorf("curvePreferences = %v, want %v", got, want)
++		}
++		if config.supportsCurve(VersionTLS12, testGroupP256) || config.supportsCurve(VersionTLS13, testGroupP256) {
++			t.Error("supportsCurve accepted an external group in FIPS 140-3 mode")
++		}
++	})
++}
++
++func TestKeyExchangeDuplicateID(t *testing.T) {
++	var kem testKEM
++	ke := kem.keyExchange(testGroupP256, ecdh.P256())
++	tls12, tls13 := ke, ke
++	tls12.MaxVersion = VersionTLS12
++	tls13.MinVersion = VersionTLS13
++	for _, tt := range []struct {
++		name    string
++		kes     []KeyExchange
++		wantErr bool
++	}{
++		{"same entry twice", []KeyExchange{ke, ke}, true},
++		{"overlapping versions", []KeyExchange{tls12, ke}, true},
++		{"disjoint versions", []KeyExchange{tls12, tls13}, false},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MaxVersion = VersionTLS12
++			clientConfig.KeyExchanges = tt.kes
++			serverConfig := testConfigServer.Clone()
++			serverConfig.KeyExchanges = []KeyExchange{tls12}
++			_, _, err := testHandshake(t, clientConfig, serverConfig)
++			if tt.wantErr != (err != nil) {
++				t.Errorf("err = %v, want an error: %v", err, tt.wantErr)
++			}
++			if err != nil && !strings.Contains(err.Error(), "KeyExchanges") {
++				t.Errorf("err = %v, want an error about KeyExchanges", err)
++			}
++		})
++	}
++}
+diff --git a/src/crypto/tls/key_schedule.go b/src/crypto/tls/key_schedule.go
+--- a/src/crypto/tls/key_schedule.go
++++ b/src/crypto/tls/key_schedule.go
+@@ -52,8 +52,9 @@ func (c *cipherSuiteTLS13) exportKeyingMaterial(s *tls13.MasterSecret, transcrip
+ }
+ 
+ type keySharePrivateKeys struct {
+-	ecdhe *ecdh.PrivateKey
+-	mlkem crypto.Decapsulator
++	ecdhe    *ecdh.PrivateKey
++	mlkem    crypto.Decapsulator
++	external crypto.Decapsulator // for Config.KeyExchanges
+ }
+ 
+ // A keyExchange implements a TLS 1.3 KEM.
+@@ -114,6 +115,44 @@ func keyExchangeForCurveID(id CurveID) (keyExchange, error) {
+ 	}
+ }
+ 
++// keyExchangeForCurveID is like the function keyExchangeForCurveID, but
++// also returns the TLS 1.3 groups of c.KeyExchanges.
++func (c *Config) keyExchangeForCurveID(id CurveID) (keyExchange, error) {
++	if ke := c.keyExchange(VersionTLS13, id); ke != nil {
++		return &externalKeyExchange{ke}, nil
++	}
++	return keyExchangeForCurveID(id)
++}
++
++// externalKeyExchange is a TLS 1.3 key share group from Config.KeyExchanges.
++type externalKeyExchange struct {
++	ke *KeyExchange
++}
++
++func (e *externalKeyExchange) keyShares(_ io.Reader) (*keySharePrivateKeys, []keyShare, error) {
++	priv, err := e.ke.GenerateKey()
++	if err != nil {
++		return nil, nil, err
++	}
++	return &keySharePrivateKeys{external: priv}, []keyShare{{e.ke.ID, priv.Encapsulator().Bytes()}}, nil
++}
++
++func (e *externalKeyExchange) serverSharedSecret(_ io.Reader, clientKeyShare []byte) ([]byte, keyShare, error) {
++	peerKey, err := e.ke.NewEncapsulator(clientKeyShare)
++	if err != nil {
++		return nil, keyShare{}, err
++	}
++	sharedKey, ciphertext := peerKey.Encapsulate()
++	return sharedKey, keyShare{e.ke.ID, ciphertext}, nil
++}
++
++func (e *externalKeyExchange) clientSharedSecret(priv *keySharePrivateKeys, serverKeyShare []byte) ([]byte, error) {
++	if priv.external == nil {
++		return nil, errors.New("tls: internal error: no key for the external key exchange")
++	}
++	return priv.external.Decapsulate(serverKeyShare)
++}
++
+ type mlkem1024KeyExchange struct{}
+ 
+ func (ke *mlkem1024KeyExchange) keyShares(_ io.Reader) (*keySharePrivateKeys, []keyShare, error) {
+diff --git a/src/crypto/tls/tls_test.go b/src/crypto/tls/tls_test.go
+--- a/src/crypto/tls/tls_test.go
++++ b/src/crypto/tls/tls_test.go
+@@ -993,6 +993,8 @@ func TestCloneNonFuncFields(t *testing.T) {
+ 			f.Set(reflect.ValueOf([]uint16{1, 2}))
+ 		case "CurvePreferences":
+ 			f.Set(reflect.ValueOf([]CurveID{CurveP256}))
++		case "KeyExchanges":
++			f.Set(reflect.ValueOf([]KeyExchange{{ID: 0xFE01, MaxVersion: VersionTLS12}}))
+ 		case "Renegotiation":
+ 			f.Set(reflect.ValueOf(RenegotiateOnceAsClient))
+ 		case "EncryptedClientHelloConfigList":

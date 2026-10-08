@@ -1,0 +1,867 @@
+crypto/tls: sign with keys of types this package doesn't implement
+
+A Certificate's PrivateKey can be any crypto.Signer, but crypto/tls
+derives the signature schemes, the cipher suites and the certificate
+selection from the type of its public key, and rejects other types. A
+hardware or smart card key whose public key type crypto/tls doesn't know,
+such as an ECDSA key on a curve that crypto/ecdsa doesn't implement, can't
+be used, although crypto/tls only needs the key to sign. Issue #28660
+added SignMessage support for such signers; this is the follow-up for
+their public key types.
+
+For a PrivateKey whose public key is of a type this package doesn't
+implement, Certificate.SupportedSignatureAlgorithms becomes required and
+authoritative: it lists the schemes the key can sign with. In TLS 1.2,
+the listed schemes that this package implements are used; they must be
+all ECDSA or all RSA (PKCS #1 v1.5 or RSA-PSS) schemes, and that
+signature type selects the cipher suites, as the public key type does
+for other keys.
+ClientHelloInfo.SupportsCertificate and
+CertificateRequestInfo.SupportsCertificate check the schemes, but not the
+key's curve against the client's supported groups, since the curve is
+unknown; a GetCertificate callback can add that check. Signing in TLS 1.2
+goes through crypto.SignMessage with the scheme's hash, as for other keys.
+
+In TLS 1.3, the schemes this package implements are bound to key types it
+implements (an ECDSA scheme to its curve), so such a key signs only with
+the listed schemes that this package doesn't implement, such as
+ecdsa_brainpoolP256r1tls13_sha256 (RFC 8734). This package doesn't know
+their hash, so the key must be a crypto.MessageSigner: SignMessage gets
+the unhashed content and a new *SignatureSchemeOptions that names the
+scheme; its HashFunc returns zero. A dedicated type, rather than making
+SignatureScheme itself a crypto.SignerOpts, keeps every SignatureScheme
+from being accepted as signer options: rsa.PrivateKey.Sign(rand, digest,
+PSSWithSHA256) would compile and silently make a PKCS #1 v1.5 signature.
+A peer advertises such schemes only if it can verify them.
+
+Such certificates are not used before TLS 1.2 or in FIPS 140-3 mode.
+
+The tests wrap a P-256 key in a signer whose Public method returns an
+unknown type, so peers verify its signatures as usual. In TLS 1.3, the
+signer uses a private-use scheme for P-256 with SHA-256, its certificate
+names a made-up curve, and the peer verifies it with
+Config.VerifyUnsupportedSignature.
+
+ivory: P3, profiles core and kt. Base: go1.27.2 with P0-P2. Upstream:
+proposal B. Requirements: A_17089-03, A_22453 (gemSpec_Krypt V2.51.0,
+gemSpec_KT V3.17.1).
+Status: TLS 1.2 and TLS 1.3.
+
+diff --git a/src/crypto/tls/auth.go b/src/crypto/tls/auth.go
+--- a/src/crypto/tls/auth.go
++++ b/src/crypto/tls/auth.go
+@@ -12,6 +12,7 @@ import (
+ 	"crypto/elliptic"
+ 	"crypto/mldsa"
+ 	"crypto/rsa"
++	"crypto/tls/internal/fips140tls"
+ 	"crypto/x509"
+ 	"errors"
+ 	"fmt"
+@@ -282,6 +283,100 @@ func signatureSchemesForPublicKey(version uint16, pub crypto.PublicKey) []Signat
+ 	}
+ }
+ 
++// isOpaquePublicKey reports whether pub is of a type that this package doesn't
++// implement. A Certificate with such a key signs with the schemes in its
++// SupportedSignatureAlgorithms.
++func isOpaquePublicKey(pub crypto.PublicKey) bool {
++	switch pub.(type) {
++	case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey, *mldsa.PublicKey:
++		return false
++	}
++	return true
++}
++
++// signsUnimplementedSchemes reports whether c may sign with signature schemes
++// that this package doesn't implement: its key must be a crypto.MessageSigner
++// whose public key is of a type this package doesn't implement. SignMessage
++// then gets the unhashed message and a *SignatureSchemeOptions.
++func signsUnimplementedSchemes(c *Certificate) bool {
++	ms, ok := c.PrivateKey.(crypto.MessageSigner)
++	return ok && isOpaquePublicKey(ms.Public())
++}
++
++// A SignatureSchemeOptions is the crypto.SignerOpts that this package passes
++// to [crypto.MessageSigner.SignMessage] when a key of a type this package
++// doesn't implement signs with a signature scheme that this package doesn't
++// implement (see [Certificate.SupportedSignatureAlgorithms]). The message is
++// not hashed: the signer applies the hash, if any, that Scheme defines.
++type SignatureSchemeOptions struct {
++	Scheme SignatureScheme
++}
++
++// HashFunc returns zero, since the message passed with SignatureSchemeOptions
++// is not hashed.
++func (*SignatureSchemeOptions) HashFunc() crypto.Hash { return 0 }
++
++// opaqueSignatureSchemes returns the signature schemes that c, a certificate
++// whose public key is of a type this package doesn't implement, can sign with
++// in a connection of version vers, and their signature type.
++//
++// In TLS 1.2, they are the schemes this package implements, and the type is
++// signatureECDSA, or signaturePKCS1v15 if they are RSA schemes (PKCS #1 v1.5
++// or RSA-PSS). In TLS 1.3, the schemes this package implements are bound to
++// public key types it implements (ECDSA schemes to a curve), so they are the
++// other schemes, and the type is zero.
++func opaqueSignatureSchemes(vers uint16, c *Certificate) ([]SignatureScheme, uint8, error) {
++	pub := c.PrivateKey.(crypto.Signer).Public()
++	if len(c.SupportedSignatureAlgorithms) == 0 {
++		return nil, 0, fmt.Errorf("tls: certificate key (%T) is not supported by this package, and Certificate.SupportedSignatureAlgorithms is empty", pub)
++	}
++	if vers < VersionTLS12 {
++		return nil, 0, fmt.Errorf("tls: certificate key (%T) is not supported by this package, and can only be used in TLS 1.2 and TLS 1.3", pub)
++	}
++	if fips140tls.Required() {
++		return nil, 0, fmt.Errorf("tls: certificate key (%T) is not supported in FIPS 140-3 mode", pub)
++	}
++	if vers == VersionTLS13 {
++		if !signsUnimplementedSchemes(c) {
++			return nil, 0, fmt.Errorf("tls: certificate key (%T) is not supported by this package, and must implement crypto.MessageSigner to be used in TLS 1.3", pub)
++		}
++		var schemes []SignatureScheme
++		for _, s := range c.SupportedSignatureAlgorithms {
++			if _, _, err := typeAndHashFromSignatureScheme(s); err != nil {
++				schemes = append(schemes, s)
++			}
++		}
++		if len(schemes) == 0 {
++			return nil, 0, fmt.Errorf("tls: Certificate.SupportedSignatureAlgorithms has no TLS 1.3 signature algorithm for a certificate key (%T) that is not supported by this package", pub)
++		}
++		return schemes, 0, nil
++	}
++	var schemes []SignatureScheme
++	var sigType uint8
++	for _, s := range c.SupportedSignatureAlgorithms {
++		t, _, err := typeAndHashFromSignatureScheme(s)
++		if err != nil {
++			continue
++		}
++		switch t {
++		case signatureECDSA:
++		case signaturePKCS1v15, signatureRSAPSS:
++			t = signaturePKCS1v15
++		default:
++			return nil, 0, fmt.Errorf("tls: signature algorithm %v can't be used with a certificate key (%T) that is not supported by this package", s, pub)
++		}
++		if sigType != 0 && t != sigType {
++			return nil, 0, errors.New("tls: Certificate.SupportedSignatureAlgorithms mixes ECDSA and RSA for a key that is not supported by this package")
++		}
++		sigType = t
++		schemes = append(schemes, s)
++	}
++	if len(schemes) == 0 {
++		return nil, 0, fmt.Errorf("tls: Certificate.SupportedSignatureAlgorithms has no signature algorithm known to this package for a certificate key (%T)", pub)
++	}
++	return schemes, sigType, nil
++}
++
+ // selectSignatureScheme picks a SignatureScheme from the peer's preference list
+ // that works with the selected certificate. It's only called for protocol
+ // versions that support signature algorithms, so TLS 1.2 and 1.3.
+@@ -290,11 +385,20 @@ func selectSignatureScheme(vers uint16, c *Certificate, peerAlgs []SignatureSche
+ 	if !ok {
+ 		return 0, unsupportedCertificateError(c)
+ 	}
+-	supportedAlgs := signatureSchemesForPublicKey(vers, priv.Public())
+-	if c.SupportedSignatureAlgorithms != nil {
+-		supportedAlgs = slices.DeleteFunc(supportedAlgs, func(sigAlg SignatureScheme) bool {
+-			return !isSupportedSignatureAlgorithm(sigAlg, c.SupportedSignatureAlgorithms)
+-		})
++	var supportedAlgs []SignatureScheme
++	if isOpaquePublicKey(priv.Public()) {
++		var err error
++		supportedAlgs, _, err = opaqueSignatureSchemes(vers, c)
++		if err != nil {
++			return 0, err
++		}
++	} else {
++		supportedAlgs = signatureSchemesForPublicKey(vers, priv.Public())
++		if c.SupportedSignatureAlgorithms != nil {
++			supportedAlgs = slices.DeleteFunc(supportedAlgs, func(sigAlg SignatureScheme) bool {
++				return !isSupportedSignatureAlgorithm(sigAlg, c.SupportedSignatureAlgorithms)
++			})
++		}
+ 	}
+ 	// Filter out any unsupported signature algorithms, for example due to
+ 	// FIPS 140-3 policy, tlssha1=0, or protocol version.
+diff --git a/src/crypto/tls/common.go b/src/crypto/tls/common.go
+--- a/src/crypto/tls/common.go
++++ b/src/crypto/tls/common.go
+@@ -1540,7 +1540,13 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
+ 			return errors.New("connection doesn't support ML-DSA")
+ 		case *rsa.PublicKey:
+ 		default:
+-			return supportsRSAFallback(unsupportedCertificateError(c))
++			// The key's curve, if any, is unknown, so supported_groups
++			// can't be checked. See Certificate.SupportedSignatureAlgorithms.
++			if _, err := selectSignatureScheme(vers, c, chi.SignatureSchemes); err != nil {
++				return supportsRSAFallback(err)
++			}
++			_, sigType, _ := opaqueSignatureSchemes(vers, c)
++			ecdsaCipherSuite = sigType == signatureECDSA
+ 		}
+ 	} else {
+ 		return supportsRSAFallback(unsupportedCertificateError(c))
+@@ -1676,6 +1682,26 @@ type Certificate struct {
+ 	PrivateKey crypto.PrivateKey
+ 	// SupportedSignatureAlgorithms is an optional list restricting what
+ 	// signature algorithms the PrivateKey can be used for.
++	//
++	// If PrivateKey is a crypto.Signer whose public key is of a type this
++	// package doesn't implement (such as a hardware key on a curve that
++	// crypto/ecdsa doesn't support), SupportedSignatureAlgorithms is
++	// required, and it lists the signature algorithms the key can sign
++	// with. Such certificates are used in TLS 1.2 and TLS 1.3, but not in
++	// FIPS 140-3 mode.
++	//
++	// In TLS 1.2, the listed algorithms that this package implements are
++	// used. They must be all ECDSA or all RSA (PKCS #1 v1.5 or RSA-PSS)
++	// algorithms. Since this package can't know the key's curve,
++	// [ClientHelloInfo.SupportsCertificate] doesn't check it against the
++	// client's supported groups; a GetCertificate callback can do that.
++	//
++	// In TLS 1.3, the algorithms this package implements are bound to key
++	// types it implements, so the listed algorithms that it doesn't
++	// implement are used instead, such as ecdsa_brainpoolP256r1tls13_sha256
++	// (RFC 8734). PrivateKey must then implement [crypto.MessageSigner]:
++	// SignMessage is called with the unhashed message and a
++	// [*SignatureSchemeOptions] that names the algorithm.
+ 	SupportedSignatureAlgorithms []SignatureScheme
+ 	// OCSPStaple contains an optional OCSP response which will be served
+ 	// to clients that request it.
+diff --git a/src/crypto/tls/handshake_client_tls13.go b/src/crypto/tls/handshake_client_tls13.go
+--- a/src/crypto/tls/handshake_client_tls13.go
++++ b/src/crypto/tls/handshake_client_tls13.go
+@@ -787,7 +787,7 @@ func (hs *clientHandshakeStateTLS13) sendClientCertificate() error {
+ 	}
+ 
+ 	sigType, sigHash, err := typeAndHashFromSignatureScheme(certVerifyMsg.signatureAlgorithm)
+-	if err != nil {
++	if err != nil && !signsUnimplementedSchemes(cert) {
+ 		return c.sendAlert(alertInternalError)
+ 	}
+ 
+@@ -795,6 +795,9 @@ func (hs *clientHandshakeStateTLS13) sendClientCertificate() error {
+ 	signOpts := crypto.SignerOpts(sigHash)
+ 	if sigType == signatureRSAPSS {
+ 		signOpts = &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: sigHash}
++	} else if err != nil {
++		// See Certificate.SupportedSignatureAlgorithms.
++		signOpts = &SignatureSchemeOptions{Scheme: certVerifyMsg.signatureAlgorithm}
+ 	}
+ 	sig, err := crypto.SignMessage(cert.PrivateKey.(crypto.Signer), c.config.rand(), signed, signOpts)
+ 	if err != nil {
+diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_server.go
+--- a/src/crypto/tls/handshake_server.go
++++ b/src/crypto/tls/handshake_server.go
+@@ -313,8 +313,14 @@ func (hs *serverHandshakeState) processClientHello() error {
+ 			return fmt.Errorf("tls: ML-DSA certificates require TLS 1.3, but client negotiated %s",
+ 				VersionName(c.vers))
+ 		default:
+-			c.sendAlert(alertInternalError)
+-			return fmt.Errorf("tls: unsupported signing key type (%T)", priv.Public())
++			// See Certificate.SupportedSignatureAlgorithms.
++			_, sigType, err := opaqueSignatureSchemes(c.vers, hs.cert)
++			if err != nil {
++				c.sendAlert(alertInternalError)
++				return err
++			}
++			hs.ecSignOk = sigType == signatureECDSA
++			hs.rsaSignOk = sigType == signaturePKCS1v15
+ 		}
+ 	}
+ 	if priv, ok := hs.cert.PrivateKey.(crypto.Decrypter); ok {
+diff --git a/src/crypto/tls/handshake_server_tls13.go b/src/crypto/tls/handshake_server_tls13.go
+--- a/src/crypto/tls/handshake_server_tls13.go
++++ b/src/crypto/tls/handshake_server_tls13.go
+@@ -861,7 +861,7 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
+ 	certVerifyMsg.signatureAlgorithm = hs.sigAlg
+ 
+ 	sigType, sigHash, err := typeAndHashFromSignatureScheme(hs.sigAlg)
+-	if err != nil {
++	if err != nil && !signsUnimplementedSchemes(hs.cert) {
+ 		return c.sendAlert(alertInternalError)
+ 	}
+ 
+@@ -869,6 +869,9 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
+ 	signOpts := crypto.SignerOpts(sigHash)
+ 	if sigType == signatureRSAPSS {
+ 		signOpts = &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: sigHash}
++	} else if err != nil {
++		// See Certificate.SupportedSignatureAlgorithms.
++		signOpts = &SignatureSchemeOptions{Scheme: hs.sigAlg}
+ 	}
+ 	sig, err := crypto.SignMessage(hs.cert.PrivateKey.(crypto.Signer), c.config.rand(), signed, signOpts)
+ 	if err != nil {
+diff --git a/src/crypto/tls/opaque_key_test.go b/src/crypto/tls/opaque_key_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/tls/opaque_key_test.go
+@@ -0,0 +1,566 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"bytes"
++	"crypto"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"errors"
++	"io"
++	"math/big"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// opaquePublicKey is a public key type that this package doesn't implement,
++// like the key of a hardware token on a curve crypto/ecdsa doesn't support.
++type opaquePublicKey struct {
++	raw []byte
++}
++
++// opaqueSigner is a crypto.Signer whose Public method returns an
++// opaquePublicKey. It signs with a wrapped key that this package would
++// support, so that peers can verify its signatures as usual.
++type opaqueSigner struct {
++	signer crypto.Signer
++
++	mu     sync.Mutex
++	hashes []crypto.Hash // the hash of every Sign call
++}
++
++func (s *opaqueSigner) Public() crypto.PublicKey {
++	return opaquePublicKey{raw: []byte("opaque")}
++}
++
++func (s *opaqueSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
++	s.mu.Lock()
++	s.hashes = append(s.hashes, opts.HashFunc())
++	s.mu.Unlock()
++	return s.signer.Sign(rand, digest, opts)
++}
++
++func (s *opaqueSigner) signHashes() []crypto.Hash {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return append([]crypto.Hash(nil), s.hashes...)
++}
++
++// opaqueKeyCertificate returns a P-256 certificate for cn, issued by a new
++// CA, whose PrivateKey is an opaqueSigner with the given schemes, and a pool
++// with the CA.
++func opaqueKeyCertificate(t *testing.T, cn string, schemes ...SignatureScheme) (Certificate, *opaqueSigner, *x509.CertPool) {
++	t.Helper()
++	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	caTmpl := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: cn + " CA"},
++		NotBefore:             testTime().Add(-time.Hour),
++		NotAfter:              testTime().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageCertSign,
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++	}
++	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, caKey.Public(), caKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ca, err := x509.ParseCertificate(caDER)
++	if err != nil {
++		t.Fatal(err)
++	}
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber: big.NewInt(2),
++		Subject:      pkix.Name{CommonName: cn},
++		DNSNames:     []string{cn},
++		NotBefore:    testTime().Add(-time.Hour),
++		NotAfter:     testTime().Add(time.Hour),
++		KeyUsage:     x509.KeyUsageDigitalSignature,
++		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, key.Public(), caKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	signer := &opaqueSigner{signer: key}
++	pool := x509.NewCertPool()
++	pool.AddCert(ca)
++	return Certificate{
++		Certificate:                  [][]byte{der},
++		PrivateKey:                   signer,
++		SupportedSignatureAlgorithms: schemes,
++	}, signer, pool
++}
++
++func TestOpaqueKeyServer(t *testing.T) {
++	for _, tt := range []struct {
++		name       string
++		schemes    []SignatureScheme
++		wantScheme SignatureScheme
++		wantHash   crypto.Hash
++	}{
++		{"P256AndSHA256", []SignatureScheme{ECDSAWithP256AndSHA256}, ECDSAWithP256AndSHA256, crypto.SHA256},
++		// In TLS 1.2, ECDSA schemes are not bound to a curve.
++		{"P384AndSHA384", []SignatureScheme{ECDSAWithP384AndSHA384}, ECDSAWithP384AndSHA384, crypto.SHA384},
++		// Unknown schemes, for example for TLS 1.3, are ignored.
++		{"unknown scheme ignored", []SignatureScheme{0xfe01, ECDSAWithP521AndSHA512}, ECDSAWithP521AndSHA512, crypto.SHA512},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			cert, signer, pool := opaqueKeyCertificate(t, "server.example", tt.schemes...)
++			serverConfig := testConfigServer.Clone()
++			serverConfig.Certificates = []Certificate{cert}
++			serverConfig.MaxVersion = VersionTLS12
++			clientConfig := testConfigClient.Clone()
++			clientConfig.RootCAs = pool
++			clientConfig.ServerName = "server.example"
++			_, cs, err := testHandshake(t, clientConfig, serverConfig)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if cs.Version != VersionTLS12 {
++				t.Errorf("version = %x, want TLS 1.2", cs.Version)
++			}
++			if cipherSuiteByID(cs.CipherSuite).flags&suiteECSign == 0 {
++				t.Errorf("cipher suite = %v, want an ECDHE_ECDSA suite", CipherSuiteName(cs.CipherSuite))
++			}
++			if cs.testingOnlyPeerSignatureAlgorithm != tt.wantScheme {
++				t.Errorf("signature algorithm = %v, want %v", cs.testingOnlyPeerSignatureAlgorithm, tt.wantScheme)
++			}
++			if h := signer.signHashes(); len(h) != 1 || h[0] != tt.wantHash {
++				t.Errorf("Sign called with hashes %v, want [%v]", h, tt.wantHash)
++			}
++		})
++	}
++}
++
++func TestOpaqueKeyClient(t *testing.T) {
++	cert, signer, pool := opaqueKeyCertificate(t, "client.example", ECDSAWithP256AndSHA256)
++	serverConfig := testConfigServer.Clone()
++	serverConfig.MaxVersion = VersionTLS12
++	serverConfig.ClientAuth = RequireAndVerifyClientCert
++	serverConfig.ClientCAs = pool
++	clientConfig := testConfigClient.Clone()
++	clientConfig.Certificates = []Certificate{cert}
++	ss, _, err := testHandshake(t, clientConfig, serverConfig)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(ss.PeerCertificates) != 1 || ss.PeerCertificates[0].Subject.CommonName != "client.example" {
++		t.Errorf("server got peer certificates %v, want client.example", ss.PeerCertificates)
++	}
++	if ss.testingOnlyPeerSignatureAlgorithm != ECDSAWithP256AndSHA256 {
++		t.Errorf("signature algorithm = %v, want %v", ss.testingOnlyPeerSignatureAlgorithm, ECDSAWithP256AndSHA256)
++	}
++	if h := signer.signHashes(); len(h) != 1 || h[0] != crypto.SHA256 {
++		t.Errorf("Sign called with hashes %v, want [SHA-256]", h)
++	}
++}
++
++// TestOpaqueKeyCertificateSelection checks that a server with an RSA
++// certificate and a certificate with an opaque ECDSA key picks the one that
++// fits the cipher suites the client offers.
++func TestOpaqueKeyCertificateSelection(t *testing.T) {
++	// The certificates are valid for the client's server name.
++	opaqueCert, _, pool := opaqueKeyCertificate(t, "test.golang.example", ECDSAWithP256AndSHA256)
++	for _, tt := range []struct {
++		name       string
++		certs      []Certificate
++		suites     []uint16
++		wantSuite  uint16
++		wantOpaque bool
++	}{
++		{"ECDSA suites, RSA first", []Certificate{testRSA2048Cert, opaqueCert},
++			[]uint16{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true},
++		{"RSA suites, opaque first", []Certificate{opaqueCert, testRSA2048Cert},
++			[]uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, false},
++		{"both, opaque first", []Certificate{opaqueCert, testRSA2048Cert},
++			[]uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256}, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, true},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			serverConfig := testConfigServer.Clone()
++			serverConfig.Certificates = tt.certs
++			serverConfig.MaxVersion = VersionTLS12
++			clientConfig := testConfigClient.Clone()
++			clientConfig.CipherSuites = tt.suites
++			clientConfig.InsecureSkipVerify = true
++			_, cs, err := testHandshake(t, clientConfig, serverConfig)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if cs.CipherSuite != tt.wantSuite {
++				t.Errorf("cipher suite = %v, want %v", CipherSuiteName(cs.CipherSuite), CipherSuiteName(tt.wantSuite))
++			}
++			leaf := cs.PeerCertificates[0]
++			opaque := leaf.Issuer.CommonName == "test.golang.example CA"
++			if opaque != tt.wantOpaque {
++				t.Errorf("server sent the certificate issued by %q; want the opaque one: %v", leaf.Issuer.CommonName, tt.wantOpaque)
++			}
++			if opaque {
++				if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, CurrentTime: testTime()}); err != nil {
++					t.Error(err)
++				}
++			}
++		})
++	}
++}
++
++func TestOpaqueKeySupportsCertificate(t *testing.T) {
++	opaqueCert, _, pool := opaqueKeyCertificate(t, "example.golang", ECDSAWithP256AndSHA256)
++	otherCert, _, _ := opaqueKeyCertificate(t, "other.example", ECDSAWithP256AndSHA256)
++	noSchemes := opaqueCert
++	noSchemes.SupportedSignatureAlgorithms = nil
++	mixed := opaqueCert
++	mixed.SupportedSignatureAlgorithms = []SignatureScheme{ECDSAWithP256AndSHA256, PKCS1WithSHA256}
++	ed := opaqueCert
++	ed.SupportedSignatureAlgorithms = []SignatureScheme{Ed25519}
++	unknownOnly := opaqueCert
++	unknownOnly.SupportedSignatureAlgorithms = []SignatureScheme{0xfe01}
++	msgCert := opaqueCert
++	msgCert.PrivateKey = &opaqueMessageSigner{opaqueSigner: opaqueCert.PrivateKey.(*opaqueSigner)}
++	msgCert.SupportedSignatureAlgorithms = []SignatureScheme{ECDSAWithP256AndSHA256, testSchemeUnimplemented}
++
++	chi := func(versions []uint16, curves []CurveID, schemes []SignatureScheme) *ClientHelloInfo {
++		return &ClientHelloInfo{
++			CipherSuites:      []uint16{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
++			SupportedCurves:   curves,
++			SupportedPoints:   []uint8{pointFormatUncompressed},
++			SignatureSchemes:  schemes,
++			SupportedVersions: versions,
++			config:            &Config{},
++		}
++	}
++	tls12 := []uint16{VersionTLS12}
++	for _, tt := range []struct {
++		name    string
++		cert    *Certificate
++		chi     *ClientHelloInfo
++		wantErr string
++	}{
++		{"TLS 1.2", &opaqueCert, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{ECDSAWithP256AndSHA256}), ""},
++		// The curve of an opaque key is unknown, so it is not checked
++		// against supported_groups. A P-256 key would fail here.
++		{"curve not checked", &opaqueCert, chi(tls12, []CurveID{X25519}, []SignatureScheme{ECDSAWithP256AndSHA256}), ""},
++		{"no common scheme", &opaqueCert, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{ECDSAWithP384AndSHA384}), "doesn't support any of the certificate's signature algorithms"},
++		{"no RSA fallback", &opaqueCert, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{PKCS1WithSHA256}), "doesn't support any of the certificate's signature algorithms"},
++		{"TLS 1.3 without MessageSigner", &opaqueCert, chi([]uint16{VersionTLS13}, []CurveID{CurveP256}, []SignatureScheme{ECDSAWithP256AndSHA256, testSchemeUnimplemented}), "must implement crypto.MessageSigner"},
++		{"TLS 1.3", &msgCert, chi([]uint16{VersionTLS13}, []CurveID{X25519}, []SignatureScheme{testSchemeUnimplemented}), ""},
++		// In TLS 1.3, ECDSAWithP256AndSHA256 is bound to P-256 keys.
++		{"TLS 1.3 implemented scheme", &msgCert, chi([]uint16{VersionTLS13}, []CurveID{X25519}, []SignatureScheme{ECDSAWithP256AndSHA256}), "doesn't support any of the certificate's signature algorithms"},
++		{"no SupportedSignatureAlgorithms", &noSchemes, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{ECDSAWithP256AndSHA256}), "SupportedSignatureAlgorithms is empty"},
++		{"ECDSA and RSA mixed", &mixed, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{ECDSAWithP256AndSHA256}), "mixes ECDSA and RSA"},
++		{"Ed25519", &ed, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{Ed25519}), "can't be used with a certificate key"},
++		{"only unknown schemes", &unknownOnly, chi(tls12, []CurveID{CurveP256}, []SignatureScheme{ECDSAWithP256AndSHA256}), "no signature algorithm known"},
++	} {
++		t.Run("ClientHelloInfo/"+tt.name, func(t *testing.T) {
++			err := tt.chi.SupportsCertificate(tt.cert)
++			if tt.wantErr == "" {
++				if err != nil {
++					t.Errorf("SupportsCertificate: %v", err)
++				}
++				return
++			}
++			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
++				t.Errorf("SupportsCertificate: err = %v, want %q", err, tt.wantErr)
++			}
++		})
++	}
++
++	// A P-256 key of the same certificate fails the curve check that is
++	// skipped for the opaque key.
++	p256Cert := opaqueCert
++	p256Cert.PrivateKey = opaqueCert.PrivateKey.(*opaqueSigner).signer
++	if err := chi(tls12, []CurveID{X25519}, []SignatureScheme{ECDSAWithP256AndSHA256}).SupportsCertificate(&p256Cert); err == nil {
++		t.Error("SupportsCertificate accepted a P-256 key without P-256 in supported_groups")
++	}
++
++	// Client certificates: the signature schemes and the acceptable CAs.
++	issuer := func(c Certificate) []byte {
++		x, err := x509.ParseCertificate(c.Certificate[0])
++		if err != nil {
++			t.Fatal(err)
++		}
++		return x.RawIssuer
++	}
++	for _, tt := range []struct {
++		name    string
++		cri     *CertificateRequestInfo
++		wantErr string
++	}{
++		{"no acceptable CAs", &CertificateRequestInfo{Version: VersionTLS12, SignatureSchemes: []SignatureScheme{ECDSAWithP256AndSHA256}}, ""},
++		{"acceptable CA", &CertificateRequestInfo{Version: VersionTLS12, SignatureSchemes: []SignatureScheme{ECDSAWithP256AndSHA256}, AcceptableCAs: [][]byte{issuer(opaqueCert)}}, ""},
++		{"other CA", &CertificateRequestInfo{Version: VersionTLS12, SignatureSchemes: []SignatureScheme{ECDSAWithP256AndSHA256}, AcceptableCAs: [][]byte{issuer(otherCert)}}, "not signed by an acceptable CA"},
++		{"RSA schemes only", &CertificateRequestInfo{Version: VersionTLS12, SignatureSchemes: []SignatureScheme{PKCS1WithSHA256, PSSWithSHA256}}, "doesn't support any"},
++		{"TLS 1.3 without MessageSigner", &CertificateRequestInfo{Version: VersionTLS13, SignatureSchemes: []SignatureScheme{testSchemeUnimplemented}}, "must implement crypto.MessageSigner"},
++	} {
++		t.Run("CertificateRequestInfo/"+tt.name, func(t *testing.T) {
++			err := tt.cri.SupportsCertificate(&opaqueCert)
++			if tt.wantErr == "" {
++				if err != nil {
++					t.Errorf("SupportsCertificate: %v", err)
++				}
++				return
++			}
++			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
++				t.Errorf("SupportsCertificate: err = %v, want %q", err, tt.wantErr)
++			}
++		})
++	}
++
++	// In a handshake, a client sends the certificate only if the server
++	// accepts its CA.
++	for _, tt := range []struct {
++		name     string
++		cas      *x509.CertPool
++		wantSent bool
++	}{
++		{"acceptable CA", pool, true},
++		{"other CA", x509.NewCertPool(), false},
++	} {
++		t.Run("handshake/"+tt.name, func(t *testing.T) {
++			if !tt.wantSent {
++				_, _, otherPool := opaqueKeyCertificate(t, "unrelated.example", ECDSAWithP256AndSHA256)
++				tt.cas = otherPool
++			}
++			serverConfig := testConfigServer.Clone()
++			serverConfig.MaxVersion = VersionTLS12
++			serverConfig.ClientAuth = RequestClientCert
++			serverConfig.ClientCAs = tt.cas
++			clientConfig := testConfigClient.Clone()
++			clientConfig.Certificates = []Certificate{opaqueCert}
++			ss, _, err := testHandshake(t, clientConfig, serverConfig)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if sent := len(ss.PeerCertificates) > 0; sent != tt.wantSent {
++				t.Errorf("client sent a certificate: %v, want %v", sent, tt.wantSent)
++			}
++		})
++	}
++}
++
++func TestOpaqueKeyErrors(t *testing.T) {
++	opaqueCert, _, _ := opaqueKeyCertificate(t, "example.golang", ECDSAWithP256AndSHA256)
++	for _, tt := range []struct {
++		name       string
++		schemes    []SignatureScheme
++		maxVersion uint16
++		serverErr  string
++	}{
++		{"no SupportedSignatureAlgorithms", nil, VersionTLS12, "SupportedSignatureAlgorithms is empty"},
++		{"ECDSA and RSA mixed", []SignatureScheme{ECDSAWithP256AndSHA256, PSSWithSHA256}, VersionTLS12, "mixes ECDSA and RSA"},
++		{"TLS 1.3 without MessageSigner", []SignatureScheme{ECDSAWithP256AndSHA256}, VersionTLS13, "must implement crypto.MessageSigner"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			cert := opaqueCert
++			cert.SupportedSignatureAlgorithms = tt.schemes
++			serverConfig := testConfigServer.Clone()
++			serverConfig.Certificates = []Certificate{cert}
++			serverConfig.MaxVersion = tt.maxVersion
++			clientConfig := testConfigClient.Clone()
++			clientConfig.InsecureSkipVerify = true
++			clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++			if clientErr == nil {
++				t.Error("handshake succeeded")
++			}
++			if serverErr == nil || !strings.Contains(serverErr.Error(), tt.serverErr) {
++				t.Errorf("server error = %v, want %q", serverErr, tt.serverErr)
++			}
++		})
++	}
++}
++
++func TestOpaqueKeyFIPS(t *testing.T) {
++	opaqueCert, _, _ := opaqueKeyCertificate(t, "example.golang", ECDSAWithP256AndSHA256)
++	runWithFIPSEnabled(t, func(t *testing.T) {
++		serverConfig := testConfigServer.Clone()
++		serverConfig.Certificates = []Certificate{opaqueCert}
++		serverConfig.MaxVersion = VersionTLS12
++		clientConfig := testConfigClient.Clone()
++		clientConfig.InsecureSkipVerify = true
++		clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++		if clientErr == nil {
++			t.Error("handshake succeeded in FIPS 140-3 mode")
++		}
++		if serverErr == nil || !strings.Contains(serverErr.Error(), "FIPS 140-3") {
++			t.Errorf("server error = %v, want a FIPS 140-3 error", serverErr)
++		}
++	})
++}
++
++// testSchemeUnimplemented is a private-use signature scheme (RFC 8446,
++// Section 4.2.3), so this package doesn't implement it. In these tests it
++// stands for ECDSA with a P-256 key and SHA-256, like a TLS 1.3 scheme for
++// a curve this package doesn't support.
++const testSchemeUnimplemented SignatureScheme = 0xfe01
++
++// opaqueMessageSigner is an opaqueSigner that also implements
++// crypto.MessageSigner, which TLS 1.3 requires, and can sign with
++// testSchemeUnimplemented.
++type opaqueMessageSigner struct {
++	*opaqueSigner
++
++	mu   sync.Mutex
++	opts []crypto.SignerOpts // the opts of every SignMessage call
++	msgs [][]byte            // the msg of every SignMessage call
++}
++
++func (s *opaqueMessageSigner) SignMessage(rand io.Reader, msg []byte, opts crypto.SignerOpts) ([]byte, error) {
++	s.mu.Lock()
++	s.opts = append(s.opts, opts)
++	s.msgs = append(s.msgs, bytes.Clone(msg))
++	s.mu.Unlock()
++	o, ok := opts.(*SignatureSchemeOptions)
++	if !ok {
++		return crypto.SignMessage(s.opaqueSigner, rand, msg, opts)
++	}
++	if o.Scheme != testSchemeUnimplemented {
++		return nil, errors.New("unexpected signature scheme")
++	}
++	h := sha256.Sum256(msg)
++	return s.opaqueSigner.Sign(rand, h[:], crypto.SHA256)
++}
++
++// verifyTestScheme is a Config.VerifyUnsupportedSignature for certificates
++// made by unsupportedKeyCertificate that accepts testSchemeUnimplemented.
++func verifyTestScheme(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error {
++	if scheme != testSchemeUnimplemented {
++		return errors.New("unexpected signature scheme")
++	}
++	return verifyUnsupportedCurveSignature(leaf, ECDSAWithP256AndSHA256, signed, sig)
++}
++
++// advertiseTestScheme makes this package advertise testSchemeUnimplemented
++// after its default signature algorithms until the test ends.
++func advertiseTestScheme(t *testing.T) {
++	saved := testingOnlySupportedSignatureAlgorithms
++	testingOnlySupportedSignatureAlgorithms = append(defaultSupportedSignatureAlgorithms(), testSchemeUnimplemented)
++	t.Cleanup(func() { testingOnlySupportedSignatureAlgorithms = saved })
++}
++
++// unimplementedSchemeCertificate returns a certificate whose key this
++// package doesn't support (see unsupportedKeyCertificate) and whose
++// PrivateKey is an opaqueMessageSigner with the given schemes, and a pool
++// with its CA.
++func unimplementedSchemeCertificate(t *testing.T, cn string, schemes ...SignatureScheme) (Certificate, *opaqueMessageSigner, *x509.CertPool) {
++	cert, pool := unsupportedKeyCertificate(t, cn)
++	signer := &opaqueMessageSigner{opaqueSigner: &opaqueSigner{signer: cert.PrivateKey.(crypto.Signer)}}
++	cert.PrivateKey = signer
++	cert.SupportedSignatureAlgorithms = schemes
++	return cert, signer, pool
++}
++
++// TestOpaqueKeyTLS13 checks that in TLS 1.3 an opaque key signs with a
++// scheme this package doesn't implement, through SignMessage with the
++// unhashed content and SignatureSchemeOptions, and that the peer passes the
++// same content to Config.VerifyUnsupportedSignature.
++func TestOpaqueKeyTLS13(t *testing.T) {
++	for _, tt := range []struct {
++		name    string
++		client  bool // whether the opaque key is the client's
++		context string
++	}{
++		{"server", false, serverSignatureContext},
++		{"client", true, clientSignatureContext},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			advertiseTestScheme(t)
++			cert, signer, pool := unimplementedSchemeCertificate(t, tt.name+".example", ECDSAWithP256AndSHA256, testSchemeUnimplemented)
++			var signed [][]byte
++			hook := func(leaf *x509.Certificate, scheme SignatureScheme, s, sig []byte) error {
++				signed = append(signed, bytes.Clone(s))
++				return verifyTestScheme(leaf, scheme, s, sig)
++			}
++			serverConfig := testConfigServer.Clone()
++			clientConfig := testConfigClient.Clone()
++			clientConfig.InsecureSkipVerify = true
++			if tt.client {
++				clientConfig.Certificates = []Certificate{cert}
++				serverConfig.ClientAuth = RequireAnyClientCert
++				serverConfig.ClientCAs = pool // sent as the acceptable CAs
++				serverConfig.VerifyUnsupportedSignature = hook
++			} else {
++				serverConfig.Certificates = []Certificate{cert}
++				clientConfig.VerifyUnsupportedSignature = hook
++			}
++			ss, cs, err := testHandshake(t, clientConfig, serverConfig)
++			if err != nil {
++				t.Fatal(err)
++			}
++			peer := cs
++			if tt.client {
++				peer = ss
++			}
++			if peer.Version != VersionTLS13 {
++				t.Errorf("version = %x, want TLS 1.3", peer.Version)
++			}
++			if peer.testingOnlyPeerSignatureAlgorithm != testSchemeUnimplemented {
++				t.Errorf("signature algorithm = %v, want %v", peer.testingOnlyPeerSignatureAlgorithm, testSchemeUnimplemented)
++			}
++			if h := signer.signHashes(); len(h) != 1 || h[0] != crypto.SHA256 {
++				t.Errorf("Sign called with hashes %v, want [SHA-256]", h)
++			}
++			signer.mu.Lock()
++			defer signer.mu.Unlock()
++			if len(signer.opts) != 1 || len(signed) != 1 {
++				t.Fatalf("SignMessage called %d times, hook called %d times; want 1 and 1", len(signer.opts), len(signed))
++			}
++			if o, ok := signer.opts[0].(*SignatureSchemeOptions); !ok || o.Scheme != testSchemeUnimplemented || o.HashFunc() != 0 {
++				t.Errorf("SignMessage opts = %#v, want &SignatureSchemeOptions{Scheme: %v}", signer.opts[0], testSchemeUnimplemented)
++			}
++			if !bytes.Equal(signer.msgs[0], signed[0]) {
++				t.Error("the signer and the hook got different messages")
++			}
++			prefix := append(bytes.Repeat([]byte{0x20}, 64), tt.context...)
++			if !bytes.HasPrefix(signed[0], prefix) || len(signed[0]) != len(prefix)+32 {
++				t.Errorf("signed content = %q, want %q and a SHA-256 transcript hash", signed[0], prefix)
++			}
++		})
++	}
++}
++
++func TestOpaqueKeyTLS13Errors(t *testing.T) {
++	for _, tt := range []struct {
++		name      string
++		schemes   []SignatureScheme
++		advertise bool
++		serverErr string
++	}{
++		{"only implemented schemes", []SignatureScheme{ECDSAWithP256AndSHA256}, true, "no TLS 1.3 signature algorithm"},
++		{"scheme not advertised", []SignatureScheme{testSchemeUnimplemented}, false, "peer doesn't support any of the certificate's signature algorithms"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.advertise {
++				advertiseTestScheme(t)
++			}
++			cert, _, _ := unimplementedSchemeCertificate(t, "server.example", tt.schemes...)
++			serverConfig := testConfigServer.Clone()
++			serverConfig.Certificates = []Certificate{cert}
++			clientConfig := testConfigClient.Clone()
++			clientConfig.InsecureSkipVerify = true
++			clientConfig.VerifyUnsupportedSignature = verifyTestScheme
++			clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++			if clientErr == nil {
++				t.Error("handshake succeeded")
++			}
++			if serverErr == nil || !strings.Contains(serverErr.Error(), tt.serverErr) {
++				t.Errorf("server error = %v, want %q", serverErr, tt.serverErr)
++			}
++		})
++	}
++}

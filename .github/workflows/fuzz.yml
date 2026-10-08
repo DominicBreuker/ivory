@@ -1,0 +1,50 @@
+name: fuzz
+
+# Runs every fuzz target of the library, in parallel, for the given time.
+# On demand only: Actions → fuzz → Run workflow. A failing target uploads
+# its failing input (testdata/fuzz/…) as an artifact; add that file to the
+# repository to keep it as a regression test.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: 'Time per target (go test -fuzztime), for example 1h or 30m'
+        required: true
+        default: '1h'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - brainpool:FuzzScalarMult
+          - brainpool:FuzzNewPublicKey
+          - brainpool:FuzzVerifyASN1
+          - x509util:FuzzParsePKIXPublicKey
+          - x509util:FuzzParsePrivateKey
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          FUZZTIME: ${{ inputs.fuzztime }}
+        run: |
+          # Short minimization: one execution of the curve fuzzers takes
+          # tens of milliseconds, and Go's default (up to 60 s per new
+          # input) stalls them.
+          go test -run '^$' -fuzz "^${TARGET#*:}\$" -fuzztime "$FUZZTIME" -fuzzminimizetime 10x "./${TARGET%%:*}"
+      - name: upload the failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ strategy.job-index }}
+          path: '*/testdata/fuzz/'

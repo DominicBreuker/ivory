@@ -1,0 +1,879 @@
+crypto/x509: parse keys on unsupported named curves as unknown
+
+ParseCertificate fails with "x509: unsupported elliptic curve" when a
+certificate's id-ecPublicKey key names a curve that crypto/x509 doesn't
+implement, such as brainpoolP256r1 (RFC 5639), which some national PKIs
+require. The whole certificate is lost, and ParseCertificates fails a
+bundle that contains one such certificate. ParseCertificateRequest
+fails the same way.
+
+Report such keys like keys with an unknown public key algorithm:
+PublicKeyAlgorithm is UnknownPublicKeyAlgorithm and PublicKey is nil, and
+the rest of the certificate or request is populated, including
+RawSubjectPublicKeyInfo, so callers can handle the key themselves. This
+is what ParseCertificate already does for unknown algorithm OIDs, and
+for ML-DSA keys under the FIPS 140-3 module v1.0.0.
+
+Malformed ECDSA parameters, implicitCurve (NULL) and specifiedCurve
+(explicit parameters, which RFC 5480 forbids) keep failing.
+ParsePKIXPublicKey keeps failing too: it has nothing else to return.
+
+Verify results don't change. A chain that Verify returns never contains
+a certificate with such a key:
+
+  - Verify rejects a leaf with such a key, on every platform, as before
+    when it couldn't be parsed;
+  - chain building already skips issuers with a nil key;
+  - chains returned by the platform verifiers (Windows, macOS, iOS) that
+    contain such a certificate are dropped. Their signatures can't be
+    checked by this package, which matters for the extra checks done
+    after the Windows verifier.
+
+The new GODEBUG setting x509unknowncurve=0 restores the parse error.
+
+ivory: P1, profiles core and kt. Base: go1.27.2. Upstream: proposal A.
+The overlay's table entry is {Name: "x509unknowncurve", Package:
+"crypto/x509"}, on whatever the module's Go version; the upstream CL
+uses Changed: <minor>, Old: "0" and documents the setting in
+doc/godebug.md (not part of the Go distribution that the overlay
+patches). runtime/metrics/doc.go is regenerated with
+"go generate runtime/metrics".
+
+diff --git a/src/crypto/x509/parser.go b/src/crypto/x509/parser.go
+--- a/src/crypto/x509/parser.go
++++ b/src/crypto/x509/parser.go
+@@ -306,6 +306,28 @@ func parseExtension(der cryptobyte.String) (pkix.Extension, error) {
+ 	return ext, nil
+ }
+ 
++// errUnsupportedCurve is returned by parsePublicKey for an ECDSA public key
++// with well-formed parameters that name a curve this package doesn't
++// implement.
++var errUnsupportedCurve = errors.New("x509: unsupported elliptic curve")
++
++var x509unknowncurve = godebug.New("x509unknowncurve")
++
++// isUnsupportedCurve reports whether err, returned by parsePublicKey, is
++// errUnsupportedCurve and the key should be reported as a key with an
++// unknown algorithm. With x509unknowncurve=0, such keys fail to parse, as
++// they did before.
++func isUnsupportedCurve(err error) bool {
++	if err != errUnsupportedCurve {
++		return false
++	}
++	if x509unknowncurve.Value() == "0" {
++		x509unknowncurve.IncNonDefault()
++		return false
++	}
++	return true
++}
++
+ func parsePublicKey(keyData *publicKeyInfo) (any, error) {
+ 	oid := keyData.Algorithm.Algorithm
+ 	params := keyData.Algorithm.Parameters
+@@ -350,7 +372,7 @@ func parsePublicKey(keyData *publicKeyInfo) (any, error) {
+ 		}
+ 		namedCurve := namedCurveFromOID(*namedCurveOID)
+ 		if namedCurve == nil {
+-			return nil, errors.New("x509: unsupported elliptic curve")
++			return nil, errUnsupportedCurve
+ 		}
+ 		return ecdsa.ParseUncompressedPublicKey(namedCurve, data)
+ 	case oid.Equal(oidPublicKeyEd25519):
+@@ -1094,6 +1116,15 @@ func parseCertificate(der []byte) (*Certificate, error) {
+ 			Algorithm: pkAI,
+ 			PublicKey: spk,
+ 		})
++		if isUnsupportedCurve(err) {
++			// Report keys on named curves that this package doesn't
++			// implement like keys with an unknown algorithm, so that
++			// callers can inspect the rest of the certificate. Verify
++			// rejects such certificates.
++			cert.PublicKeyAlgorithm = UnknownPublicKeyAlgorithm
++			cert.PublicKey, err = nil, nil
++			cert.unsupportedCurve = true
++		}
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -1152,6 +1183,13 @@ func parseCertificate(der []byte) (*Certificate, error) {
+ 
+ // ParseCertificate parses a single certificate from the given ASN.1 DER data.
+ //
++// If the certificate's public key is an ECDSA key on a named curve that this
++// package doesn't implement, its PublicKeyAlgorithm is
++// UnknownPublicKeyAlgorithm and its PublicKey is nil, as for a public key
++// algorithm this package doesn't implement. [Certificate.Verify] rejects such
++// a certificate. This behavior can be disabled, so that parsing fails, by
++// including "x509unknowncurve=0" in the GODEBUG environment variable.
++//
+ // Before Go 1.23, ParseCertificate accepted certificates with negative serial
+ // numbers. This behavior can be restored by including "x509negativeserial=1" in
+ // the GODEBUG environment variable.
+diff --git a/src/crypto/x509/unknown_curve_test.go b/src/crypto/x509/unknown_curve_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/x509/unknown_curve_test.go
+@@ -0,0 +1,623 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package x509
++
++import (
++	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/x509/pkix"
++	"encoding/hex"
++	"encoding/pem"
++	"errors"
++	"math/big"
++	"runtime/metrics"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	"golang.org/x/crypto/cryptobyte"
++	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"
++)
++
++// unsupportedCurveSPKIs are SubjectPublicKeyInfos of ECDSA keys on named
++// curves that this package doesn't implement. Generated with
++//
++//	openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:<name> \
++//		-pkeyopt ec_param_enc:named_curve |
++//		openssl pkey -pubout -outform DER | od -An -v -tx1 | tr -d ' \n'
++var unsupportedCurveSPKIs = []struct {
++	name string
++	spki string
++}{
++	{"brainpoolP256r1", "305a301406072a8648ce3d020106092b24030302080101070342000410fe29909d7784e5998670018fb979923ef5b76aaeab2e769b6f13ab31dce91a37beeba0c70f8077d4c0b3a746da2bb176dd05f1f9d150b1647edadde39342ec"},
++	{"brainpoolP384r1", "307a301406072a8648ce3d020106092b240303020801010b036200041f777862e4d9ffd89a33e62b953bd85ba4e9ffb17ab8cd0bf31dbe0ede7d045b13444b9db98750507b5ecc41cf0235f130fc7472eaf7fc6da82807d35650b2b401cf529d9ca900e6412463431617a3319d8eb5ee08a769ef03e7657a0e1bb51e"},
++	{"brainpoolP512r1", "30819b301406072a8648ce3d020106092b240303020801010d03818200042555d03ad31dbd3000b314bfee41d3bc38769f735a9b1417132688e0fd7fa52d03ea1ac91237cfcef282661cd249db9b996138903a5ff310e33f442930f20ec78277c2c97c312339f48a042aca105ad716a768adf42c584ddff9826184921df770f8e634b2408fef47d4cac366cd1191645bf65c84f43a35f826c6ce68729880"},
++	{"secp256k1", "3056301006072a8648ce3d020106052b8104000a034200044a2f0b657091a391574d1c24334b0655f84305b299f664f5badec902e42e29161e6d388dadf9fb302489a7ad4380cf7af8e2517271c0420d405268f8f0a38ddd"},
++	{"SM2", "3059301306072a8648ce3d020106082a811ccf5501822d03420004614f73576ba7a5e06b91f4a6fbf8a871ca06b4318c27a25b2c59179c9225150b59ecdbd0bd31d5ba023fd5805b24b1ff3eeb2e523e81122bb85ca0b90b3a0d18"},
++	{"prime192v1", "3049301306072a8648ce3d020106082a8648ce3d030101033200044e65bbae92e5e94624753939e0e2f060723b782ad69a7fdca210ef7adea9228d7f3932a2fb877a01e0a29672148b1d59"},
++}
++
++// brainpoolP256r1SelfSignedPEM is a self-signed certificate with a
++// brainpoolP256r1 key, generated with
++//
++//	openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:brainpoolP256r1 \
++//		-pkeyopt ec_param_enc:named_curve -out bp.key
++//	openssl req -x509 -new -key bp.key -sha256 -days 36500 \
++//		-subj /CN=brainpool.example \
++//		-addext subjectAltName=DNS:brainpool.example \
++//		-addext extendedKeyUsage=serverAuth
++const brainpoolP256r1SelfSignedPEM = `-----BEGIN CERTIFICATE-----
++MIIBxjCCAWugAwIBAgIUOdxbEmTIFsq00tvOW+kfjW27UPowCgYIKoZIzj0EAwIw
++HDEaMBgGA1UEAwwRYnJhaW5wb29sLmV4YW1wbGUwIBcNMjYxMDA4MDcxMDQ5WhgP
++MjEyNjA5MTQwNzEwNDlaMBwxGjAYBgNVBAMMEWJyYWlucG9vbC5leGFtcGxlMFow
++FAYHKoZIzj0CAQYJKyQDAwIIAQEHA0IABBD+KZCdd4TlmYZwAY+5eZI+9bdqrqsu
++dptvE6sx3OkaN77roMcPgHfUwLOnRtorsXbdBfH50VCxZH7a3eOTQuyjgYcwgYQw
++HQYDVR0OBBYEFMXpHpiE72Q+DxSrk5ZoXYLeXcutMB8GA1UdIwQYMBaAFMXpHpiE
++72Q+DxSrk5ZoXYLeXcutMA8GA1UdEwEB/wQFMAMBAf8wHAYDVR0RBBUwE4IRYnJh
++aW5wb29sLmV4YW1wbGUwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwID
++SQAwRgIhAKDA0DMgGLQwq0bLrM62tE1Na/a5Af3IZVP6/zUvcxB0AiEAnyhqJXD2
++w7NRMG8oe8iWGVqyQdizGsEjEn6AXwQLVys=
++-----END CERTIFICATE-----`
++
++const unsupportedCurveError = "x509: unsupported elliptic curve"
++
++// createCertificateWithSPKI is like CreateCertificate, but the certificate
++// carries the SubjectPublicKeyInfo spki, which CreateCertificate couldn't
++// marshal. The certificate is signed by priv, a P-256 key.
++func createCertificateWithSPKI(t *testing.T, template, parent *Certificate, spki []byte, priv *ecdsa.PrivateKey) []byte {
++	t.Helper()
++	placeholder, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	template.SignatureAlgorithm = ECDSAWithSHA256
++	der, err := CreateCertificate(rand.Reader, template, parent, placeholder.Public(), priv)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Replace the subjectPublicKeyInfo, the seventh field of the
++	// TBSCertificate (RFC 5280, Section 4.1), and sign again.
++	in := cryptobyte.String(cert.RawTBSCertificate)
++	if !in.ReadASN1(&in, cryptobyte_asn1.SEQUENCE) {
++		t.Fatal("malformed TBSCertificate")
++	}
++	var b cryptobyte.Builder
++	b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		for i := 0; !in.Empty(); i++ {
++			var field cryptobyte.String
++			if !in.ReadAnyASN1Element(&field, nil) {
++				t.Fatal("malformed TBSCertificate")
++			}
++			if i == 6 {
++				field = spki
++			}
++			b.AddBytes(field)
++		}
++	})
++	tbs := b.BytesOrPanic()
++	digest := sha256.Sum256(tbs)
++	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest[:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	b = cryptobyte.Builder{}
++	b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		b.AddBytes(tbs)
++		b.AddBytes(cert.RawSignatureAlgorithm)
++		b.AddASN1BitString(sig)
++	})
++	return b.BytesOrPanic()
++}
++
++func unsupportedCurveTemplate(cn string, serial int64, isCA bool) *Certificate {
++	return &Certificate{
++		SerialNumber:          big.NewInt(serial),
++		Subject:               pkix.Name{CommonName: cn},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		DNSNames:              []string{"example.com"},
++		ExtKeyUsage:           []ExtKeyUsage{ExtKeyUsageServerAuth},
++		KeyUsage:              KeyUsageDigitalSignature | KeyUsageCertSign,
++		BasicConstraintsValid: true,
++		IsCA:                  isCA,
++	}
++}
++
++func mustDecodeHex(t *testing.T, s string) []byte {
++	t.Helper()
++	b, err := hex.DecodeString(s)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return b
++}
++
++// p256CA returns a self-signed P-256 CA certificate and its key.
++func p256CA(t *testing.T) (*Certificate, *ecdsa.PrivateKey) {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := unsupportedCurveTemplate("P-256 root", 1, true)
++	der, err := CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return cert, key
++}
++
++func TestParseCertificateUnsupportedCurve(t *testing.T) {
++	root, rootKey := p256CA(t)
++	for _, tt := range unsupportedCurveSPKIs {
++		t.Run(tt.name, func(t *testing.T) {
++			spki := mustDecodeHex(t, tt.spki)
++			der := createCertificateWithSPKI(t, unsupportedCurveTemplate("leaf", 2, false), root, spki, rootKey)
++			cert, err := ParseCertificate(der)
++			if err != nil {
++				t.Fatalf("ParseCertificate: %v", err)
++			}
++			if cert.PublicKeyAlgorithm != UnknownPublicKeyAlgorithm {
++				t.Errorf("PublicKeyAlgorithm = %v, want UnknownPublicKeyAlgorithm", cert.PublicKeyAlgorithm)
++			}
++			if cert.PublicKey != nil {
++				t.Errorf("PublicKey = %T, want nil", cert.PublicKey)
++			}
++			if !bytes.Equal(cert.RawSubjectPublicKeyInfo, spki) {
++				t.Errorf("RawSubjectPublicKeyInfo = %x, want %x", cert.RawSubjectPublicKeyInfo, spki)
++			}
++			if cert.Subject.CommonName != "leaf" {
++				t.Errorf("Subject.CommonName = %q, want %q", cert.Subject.CommonName, "leaf")
++			}
++			if len(cert.DNSNames) != 1 || cert.DNSNames[0] != "example.com" {
++				t.Errorf("DNSNames = %q, want [example.com]", cert.DNSNames)
++			}
++			if len(cert.ExtKeyUsage) != 1 || cert.ExtKeyUsage[0] != ExtKeyUsageServerAuth {
++				t.Errorf("ExtKeyUsage = %v, want [ServerAuth]", cert.ExtKeyUsage)
++			}
++			if cert.SignatureAlgorithm != ECDSAWithSHA256 || len(cert.RawSignatureAlgorithm) == 0 {
++				t.Errorf("SignatureAlgorithm = %v (raw %x), want ECDSAWithSHA256", cert.SignatureAlgorithm, cert.RawSignatureAlgorithm)
++			}
++			if err := cert.CheckSignatureFrom(root); err != nil {
++				t.Errorf("CheckSignatureFrom(root): %v", err)
++			}
++
++			// ParsePKIXPublicKey has nothing to return for such a key.
++			if _, err := ParsePKIXPublicKey(spki); err == nil || err.Error() != unsupportedCurveError {
++				t.Errorf("ParsePKIXPublicKey: err = %v, want %q", err, unsupportedCurveError)
++			}
++		})
++	}
++}
++
++func TestParseCertificateUnsupportedCurveOpenSSL(t *testing.T) {
++	block, _ := pem.Decode([]byte(brainpoolP256r1SelfSignedPEM))
++	cert, err := ParseCertificate(block.Bytes)
++	if err != nil {
++		t.Fatalf("ParseCertificate: %v", err)
++	}
++	if cert.PublicKeyAlgorithm != UnknownPublicKeyAlgorithm || cert.PublicKey != nil {
++		t.Errorf("PublicKeyAlgorithm, PublicKey = %v, %T; want UnknownPublicKeyAlgorithm, nil", cert.PublicKeyAlgorithm, cert.PublicKey)
++	}
++	if cert.Subject.CommonName != "brainpool.example" || len(cert.DNSNames) != 1 || cert.DNSNames[0] != "brainpool.example" {
++		t.Errorf("Subject.CommonName, DNSNames = %q, %q; want brainpool.example", cert.Subject.CommonName, cert.DNSNames)
++	}
++	if !cert.IsCA || cert.SignatureAlgorithm != ECDSAWithSHA256 {
++		t.Errorf("IsCA, SignatureAlgorithm = %v, %v; want true, ECDSAWithSHA256", cert.IsCA, cert.SignatureAlgorithm)
++	}
++	// The parent's key is not supported.
++	if err := cert.CheckSignatureFrom(cert); err != ErrUnsupportedAlgorithm {
++		t.Errorf("CheckSignatureFrom(self) = %v, want ErrUnsupportedAlgorithm", err)
++	}
++	if err := cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature); err == nil {
++		t.Error("CheckSignature succeeded with an unsupported key")
++	}
++}
++
++// TestParseCertificateMalformedECDSAParameters checks that ECDSA keys with
++// parameters other than a named curve OID still fail to parse.
++func TestParseCertificateMalformedECDSAParameters(t *testing.T) {
++	point := mustDecodeHex(t, "0410fe29909d7784e5998670018fb979923ef5b76aaeab2e769b6f13ab31dce91a37beeba0c70f8077d4c0b3a746da2bb176dd05f1f9d150b1647edadde39342ec")
++	oidBrainpoolP256r1 := []byte{0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07}
++	spki := func(params []byte) []byte {
++		var b cryptobyte.Builder
++		b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++			b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++				b.AddASN1ObjectIdentifier(oidPublicKeyECDSA)
++				b.AddBytes(params)
++			})
++			b.AddASN1BitString(point)
++		})
++		return b.BytesOrPanic()
++	}
++	root, rootKey := p256CA(t)
++	for _, tt := range []struct {
++		name   string
++		params []byte
++	}{
++		{"named curve", oidBrainpoolP256r1}, // the control case
++		{"missing parameters", nil},
++		{"implicitCurve (NULL)", []byte{0x05, 0x00}},
++		{"specifiedCurve (SEQUENCE)", []byte{0x30, 0x03, 0x02, 0x01, 0x01}},
++		{"INTEGER", []byte{0x02, 0x01, 0x07}},
++		{"empty OID", []byte{0x06, 0x00}},
++		{"truncated OID", []byte{0x06, 0x02, 0x2b, 0x84}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			der := createCertificateWithSPKI(t, unsupportedCurveTemplate("leaf", 2, false), root, spki(tt.params), rootKey)
++			_, err := ParseCertificate(der)
++			if tt.name == "named curve" {
++				if err != nil {
++					t.Fatalf("ParseCertificate: %v", err)
++				}
++				return
++			}
++			if err == nil {
++				t.Fatal("ParseCertificate succeeded, want an error")
++			}
++			if err.Error() == unsupportedCurveError {
++				t.Errorf("ParseCertificate: err = %v, want a parameter error", err)
++			}
++		})
++	}
++}
++
++func TestParseCertificatesUnsupportedCurveBundle(t *testing.T) {
++	root, rootKey := p256CA(t)
++	spki := mustDecodeHex(t, unsupportedCurveSPKIs[0].spki)
++	leaf := createCertificateWithSPKI(t, unsupportedCurveTemplate("leaf", 2, false), root, spki, rootKey)
++	certs, err := ParseCertificates(append(append([]byte{}, root.Raw...), leaf...))
++	if err != nil {
++		t.Fatalf("ParseCertificates: %v", err)
++	}
++	if len(certs) != 2 {
++		t.Fatalf("ParseCertificates returned %d certificates, want 2", len(certs))
++	}
++
++	var pemBundle bytes.Buffer
++	pem.Encode(&pemBundle, &pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})
++	pem.Encode(&pemBundle, &pem.Block{Type: "CERTIFICATE", Bytes: leaf})
++	pemBundle.WriteString(brainpoolP256r1SelfSignedPEM)
++	pool := NewCertPool()
++	if !pool.AppendCertsFromPEM(pemBundle.Bytes()) {
++		t.Fatal("AppendCertsFromPEM returned false")
++	}
++	if n := pool.len(); n != 3 {
++		t.Errorf("pool has %d certificates, want 3", n)
++	}
++}
++
++func TestVerifyUnsupportedCurve(t *testing.T) {
++	root, rootKey := p256CA(t)
++	spki := mustDecodeHex(t, unsupportedCurveSPKIs[0].spki)
++	roots := NewCertPool()
++	roots.AddCert(root)
++
++	t.Run("leaf", func(t *testing.T) {
++		der := createCertificateWithSPKI(t, unsupportedCurveTemplate("leaf", 2, false), root, spki, rootKey)
++		leaf, err := ParseCertificate(der)
++		if err != nil {
++			t.Fatal(err)
++		}
++		// The signature is good, but Verify must not return the chain.
++		if err := leaf.CheckSignatureFrom(root); err != nil {
++			t.Fatalf("CheckSignatureFrom: %v", err)
++		}
++		_, err = leaf.Verify(VerifyOptions{Roots: roots, DNSName: "example.com"})
++		var invalid CertificateInvalidError
++		if !errors.As(err, &invalid) || invalid.Reason != NoValidChains || !strings.Contains(err.Error(), "unsupported elliptic curve") {
++			t.Errorf("Verify: err = %v, want a CertificateInvalidError about the unsupported curve", err)
++		}
++	})
++
++	// A certificate issued by a CA with an unsupported key can't be
++	// checked, so such CAs are never part of a chain.
++	newLeafKey := func() *ecdsa.PrivateKey {
++		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return k
++	}
++	issuedBy := func(t *testing.T, issuer *Certificate) *Certificate {
++		// The signature of the leaf is made by a P-256 key that doesn't
++		// match the issuer: there is no way to sign with the issuer's key.
++		k := newLeafKey()
++		der, err := CreateCertificate(rand.Reader, unsupportedCurveTemplate("leaf", 4, false), issuer, k.Public(), k)
++		if err != nil {
++			t.Fatal(err)
++		}
++		leaf, err := ParseCertificate(der)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return leaf
++	}
++
++	t.Run("intermediate", func(t *testing.T) {
++		der := createCertificateWithSPKI(t, unsupportedCurveTemplate("intermediate", 3, true), root, spki, rootKey)
++		inter, err := ParseCertificate(der)
++		if err != nil {
++			t.Fatal(err)
++		}
++		intermediates := NewCertPool()
++		intermediates.AddCert(inter)
++		_, err = issuedBy(t, inter).Verify(VerifyOptions{Roots: roots, Intermediates: intermediates})
++		if _, ok := err.(UnknownAuthorityError); !ok {
++			t.Errorf("Verify: err = %v (%T), want UnknownAuthorityError", err, err)
++		}
++		// The intermediate itself is rejected as a leaf.
++		if _, err := inter.Verify(VerifyOptions{Roots: roots}); err == nil {
++			t.Error("Verify of the intermediate succeeded")
++		}
++	})
++
++	t.Run("root", func(t *testing.T) {
++		tmpl := unsupportedCurveTemplate("unsupported root", 5, true)
++		der := createCertificateWithSPKI(t, tmpl, tmpl, spki, rootKey)
++		badRoot, err := ParseCertificate(der)
++		if err != nil {
++			t.Fatal(err)
++		}
++		badRoots := NewCertPool()
++		badRoots.AddCert(badRoot)
++		leaf := issuedBy(t, badRoot)
++		_, err = leaf.Verify(VerifyOptions{Roots: badRoots})
++		if _, ok := err.(UnknownAuthorityError); !ok {
++			t.Errorf("Verify: err = %v (%T), want UnknownAuthorityError", err, err)
++		}
++		if err := leaf.CheckSignatureFrom(badRoot); err != ErrUnsupportedAlgorithm {
++			t.Errorf("CheckSignatureFrom = %v, want ErrUnsupportedAlgorithm", err)
++		}
++	})
++}
++
++// brainpoolP256r1CSRPEM is a certificate request with a brainpoolP256r1 key,
++// generated with
++//
++//	openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:brainpoolP256r1 \
++//		-pkeyopt ec_param_enc:named_curve -out bp.key
++//	openssl req -new -key bp.key -sha256 -subj /CN=brainpool.example \
++//		-addext subjectAltName=DNS:brainpool.example
++const brainpoolP256r1CSRPEM = `-----BEGIN CERTIFICATE REQUEST-----
++MIIBBjCBrgIBADAcMRowGAYDVQQDDBFicmFpbnBvb2wuZXhhbXBsZTBaMBQGByqG
++SM49AgEGCSskAwMCCAEBBwNCAAQhWS2eJ1z3jBAmgVDR+nlYEzAE/VyPe6HtBwWM
++vHa9/0WXNGBCCQijb1mHJ+gfNmhfbh02H9bAPzaAWaP/cqTloC8wLQYJKoZIhvcN
++AQkOMSAwHjAcBgNVHREEFTATghFicmFpbnBvb2wuZXhhbXBsZTAKBggqhkjOPQQD
++AgNHADBEAiBTBRIbslaYpwZC/DJLPLKrUmIp7GxYAjFCFIhdQyJ+vAIgOFrxttBD
++6FzKAll5unSaiAg1GWI5eAtndNDnS5U363c=
++-----END CERTIFICATE REQUEST-----`
++
++// createCertificateRequestWithSPKI is like CreateCertificateRequest, but the
++// request carries the SubjectPublicKeyInfo spki. The request is signed by a
++// P-256 key, so its signature doesn't match spki.
++func createCertificateRequestWithSPKI(t *testing.T, spki []byte) []byte {
++	t.Helper()
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	der, err := CreateCertificateRequest(rand.Reader, &CertificateRequest{
++		Subject:  pkix.Name{CommonName: "request"},
++		DNSNames: []string{"example.com"},
++	}, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	csr, err := ParseCertificateRequest(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Replace the subjectPKInfo, the third field of the
++	// CertificationRequestInfo (RFC 2986, Section 4.1), and sign again.
++	in := cryptobyte.String(csr.RawTBSCertificateRequest)
++	if !in.ReadASN1(&in, cryptobyte_asn1.SEQUENCE) {
++		t.Fatal("malformed CertificationRequestInfo")
++	}
++	var b cryptobyte.Builder
++	b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		for i := 0; !in.Empty(); i++ {
++			var field cryptobyte.String
++			if !in.ReadAnyASN1Element(&field, nil) {
++				t.Fatal("malformed CertificationRequestInfo")
++			}
++			if i == 2 {
++				field = spki
++			}
++			b.AddBytes(field)
++		}
++	})
++	tbs := b.BytesOrPanic()
++	digest := sha256.Sum256(tbs)
++	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
++	if err != nil {
++		t.Fatal(err)
++	}
++	b = cryptobyte.Builder{}
++	b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		b.AddBytes(tbs)
++		b.AddBytes(csr.RawSignatureAlgorithm)
++		b.AddASN1BitString(sig)
++	})
++	return b.BytesOrPanic()
++}
++
++func TestParseCertificateRequestUnsupportedCurve(t *testing.T) {
++	for _, tt := range unsupportedCurveSPKIs {
++		t.Run(tt.name, func(t *testing.T) {
++			spki := mustDecodeHex(t, tt.spki)
++			csr, err := ParseCertificateRequest(createCertificateRequestWithSPKI(t, spki))
++			if err != nil {
++				t.Fatalf("ParseCertificateRequest: %v", err)
++			}
++			if csr.PublicKeyAlgorithm != UnknownPublicKeyAlgorithm || csr.PublicKey != nil {
++				t.Errorf("PublicKeyAlgorithm, PublicKey = %v, %T; want UnknownPublicKeyAlgorithm, nil", csr.PublicKeyAlgorithm, csr.PublicKey)
++			}
++			if !bytes.Equal(csr.RawSubjectPublicKeyInfo, spki) {
++				t.Errorf("RawSubjectPublicKeyInfo = %x, want %x", csr.RawSubjectPublicKeyInfo, spki)
++			}
++			if csr.Subject.CommonName != "request" || len(csr.DNSNames) != 1 || csr.DNSNames[0] != "example.com" {
++				t.Errorf("Subject.CommonName, DNSNames = %q, %q; want request, [example.com]", csr.Subject.CommonName, csr.DNSNames)
++			}
++			if csr.SignatureAlgorithm != ECDSAWithSHA256 {
++				t.Errorf("SignatureAlgorithm = %v, want ECDSAWithSHA256", csr.SignatureAlgorithm)
++			}
++			if err := csr.CheckSignature(); err == nil {
++				t.Error("CheckSignature succeeded with an unsupported key")
++			}
++		})
++	}
++
++	t.Run("OpenSSL", func(t *testing.T) {
++		block, _ := pem.Decode([]byte(brainpoolP256r1CSRPEM))
++		csr, err := ParseCertificateRequest(block.Bytes)
++		if err != nil {
++			t.Fatalf("ParseCertificateRequest: %v", err)
++		}
++		if csr.PublicKeyAlgorithm != UnknownPublicKeyAlgorithm || csr.PublicKey != nil {
++			t.Errorf("PublicKeyAlgorithm, PublicKey = %v, %T; want UnknownPublicKeyAlgorithm, nil", csr.PublicKeyAlgorithm, csr.PublicKey)
++		}
++		if csr.Subject.CommonName != "brainpool.example" || len(csr.DNSNames) != 1 || csr.DNSNames[0] != "brainpool.example" {
++			t.Errorf("Subject.CommonName, DNSNames = %q, %q; want brainpool.example", csr.Subject.CommonName, csr.DNSNames)
++		}
++		if err := csr.CheckSignature(); err != ErrUnsupportedAlgorithm {
++			t.Errorf("CheckSignature = %v, want ErrUnsupportedAlgorithm", err)
++		}
++	})
++}
++
++func TestUnknownCurveGODEBUG(t *testing.T) {
++	root, rootKey := p256CA(t)
++	spki := mustDecodeHex(t, unsupportedCurveSPKIs[0].spki)
++	certDER := createCertificateWithSPKI(t, unsupportedCurveTemplate("leaf", 2, false), root, spki, rootKey)
++	csrDER := createCertificateRequestWithSPKI(t, spki)
++
++	const name = "/godebug/non-default-behavior/x509unknowncurve:events"
++	samples := []metrics.Sample{{Name: name}}
++	count := func() uint64 {
++		metrics.Read(samples)
++		return samples[0].Value.Uint64()
++	}
++
++	for _, setting := range []string{"", "x509unknowncurve=1"} {
++		t.Run("GODEBUG="+setting, func(t *testing.T) {
++			t.Setenv("GODEBUG", setting)
++			before := count()
++			if _, err := ParseCertificate(certDER); err != nil {
++				t.Errorf("ParseCertificate: %v", err)
++			}
++			if _, err := ParseCertificateRequest(csrDER); err != nil {
++				t.Errorf("ParseCertificateRequest: %v", err)
++			}
++			if n := count() - before; n != 0 {
++				t.Errorf("%s increased by %d, want 0", name, n)
++			}
++		})
++	}
++
++	t.Run("GODEBUG=x509unknowncurve=0", func(t *testing.T) {
++		t.Setenv("GODEBUG", "x509unknowncurve=0")
++		before := count()
++		if _, err := ParseCertificate(certDER); err == nil || err.Error() != unsupportedCurveError {
++			t.Errorf("ParseCertificate: err = %v, want %q", err, unsupportedCurveError)
++		}
++		if _, err := ParseCertificateRequest(csrDER); err == nil || err.Error() != unsupportedCurveError {
++			t.Errorf("ParseCertificateRequest: err = %v, want %q", err, unsupportedCurveError)
++		}
++		if n := count() - before; n != 2 {
++			t.Errorf("%s increased by %d, want 2", name, n)
++		}
++		// Keys on supported curves don't count.
++		before = count()
++		if _, err := ParseCertificate(root.Raw); err != nil {
++			t.Errorf("ParseCertificate(P-256 root): %v", err)
++		}
++		if n := count() - before; n != 0 {
++			t.Errorf("%s increased by %d for a P-256 certificate, want 0", name, n)
++		}
++	})
++}
++
++// TestDropUnsupportedCurveChains tests the filter that Verify applies to the
++// chains returned by the platform verifiers on Windows, macOS and iOS.
++func TestDropUnsupportedCurveChains(t *testing.T) {
++	root, rootKey := p256CA(t)
++	spki := mustDecodeHex(t, unsupportedCurveSPKIs[0].spki)
++	der := createCertificateWithSPKI(t, unsupportedCurveTemplate("intermediate", 3, true), root, spki, rootKey)
++	unsupported, err := ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	der, err = CreateCertificate(rand.Reader, unsupportedCurveTemplate("leaf", 4, false), root, k.Public(), rootKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	leaf, err := ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	good := []*Certificate{leaf, root}
++	bad := []*Certificate{leaf, unsupported, root}
++	badRoot := []*Certificate{leaf, unsupported}
++	platformErr := errors.New("platform verifier failed")
++
++	for _, tt := range []struct {
++		name    string
++		chains  [][]*Certificate
++		err     error
++		want    [][]*Certificate
++		wantErr bool
++	}{
++		{"no unsupported keys", [][]*Certificate{good}, nil, [][]*Certificate{good}, false},
++		{"unsupported intermediate dropped", [][]*Certificate{bad, good}, nil, [][]*Certificate{good}, false},
++		{"unsupported root dropped", [][]*Certificate{good, badRoot}, nil, [][]*Certificate{good}, false},
++		{"no chain left", [][]*Certificate{bad, badRoot}, nil, nil, true},
++		{"platform error kept", nil, platformErr, nil, true},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			chains, err := leaf.dropUnsupportedCurveChains(tt.chains, tt.err)
++			if tt.err != nil {
++				if err != tt.err {
++					t.Errorf("err = %v, want %v", err, tt.err)
++				}
++				return
++			}
++			if tt.wantErr {
++				var invalid CertificateInvalidError
++				if !errors.As(err, &invalid) || invalid.Reason != NoValidChains || invalid.Cert != leaf || !strings.Contains(err.Error(), "unsupported elliptic curve") {
++					t.Errorf("err = %v, want a CertificateInvalidError about the unsupported curve", err)
++				}
++				if chains != nil {
++					t.Errorf("chains = %v, want nil", chains)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("err = %v", err)
++			}
++			if !slices.EqualFunc(chains, tt.want, slices.Equal) {
++				t.Errorf("got %d chains, want %d", len(chains), len(tt.want))
++			}
++		})
++	}
++}
+diff --git a/src/crypto/x509/verify.go b/src/crypto/x509/verify.go
+--- a/src/crypto/x509/verify.go
++++ b/src/crypto/x509/verify.go
+@@ -551,6 +551,12 @@ func (c *Certificate) Verify(opts VerifyOptions) ([][]*Certificate, error) {
+ 	if len(c.Raw) == 0 {
+ 		return nil, errNotParsed
+ 	}
++	// Certificates with public keys on unsupported curves used to fail
++	// parsing. Keep rejecting them here, on every platform, so that the
++	// results of Verify don't change.
++	if c.unsupportedCurve {
++		return nil, CertificateInvalidError{c, NoValidChains, "certificate public key uses an unsupported elliptic curve"}
++	}
+ 	for i := 0; i < opts.Intermediates.len(); i++ {
+ 		c, _, err := opts.Intermediates.cert(i)
+ 		if err != nil {
+@@ -567,10 +573,10 @@ func (c *Certificate) Verify(opts VerifyOptions) ([][]*Certificate, error) {
+ 		// i.e. if SetFallbackRoots was called with x509usefallbackroots=1.
+ 		systemPool := systemRootsPool()
+ 		if opts.Roots == nil && (systemPool == nil || systemPool.systemPool) {
+-			return c.systemVerify(&opts)
++			return c.dropUnsupportedCurveChains(c.systemVerify(&opts))
+ 		}
+ 		if opts.Roots != nil && opts.Roots.systemPool {
+-			platformChains, err := c.systemVerify(&opts)
++			platformChains, err := c.dropUnsupportedCurveChains(c.systemVerify(&opts))
+ 			// If the platform verifier succeeded, or there are no additional
+ 			// roots, return the platform verifier result. Otherwise, continue
+ 			// with the Go verifier.
+@@ -666,6 +672,27 @@ func (c *Certificate) Verify(opts VerifyOptions) ([][]*Certificate, error) {
+ 	return candidateChains, nil
+ }
+ 
++// dropUnsupportedCurveChains removes the chains, returned by a platform
++// verifier for the leaf c, that contain a certificate with a public key on a
++// curve this package doesn't implement. Such certificates used to fail
++// parsing, so Verify never returned them, and their signatures can't be
++// checked by this package. If no chain remains, it returns an error.
++func (c *Certificate) dropUnsupportedCurveChains(chains [][]*Certificate, err error) ([][]*Certificate, error) {
++	if err != nil {
++		return chains, err
++	}
++	kept := chains[:0:0]
++	for _, chain := range chains {
++		if !slices.ContainsFunc(chain, func(cert *Certificate) bool { return cert.unsupportedCurve }) {
++			kept = append(kept, chain)
++		}
++	}
++	if len(kept) == 0 && len(chains) != 0 {
++		return nil, CertificateInvalidError{c, NoValidChains, "certificate chain contains a public key on an unsupported elliptic curve"}
++	}
++	return kept, nil
++}
++
+ func appendToFreshChain(chain []*Certificate, cert *Certificate) []*Certificate {
+ 	n := make([]*Certificate, len(chain)+1)
+ 	copy(n, chain)
+diff --git a/src/crypto/x509/x509.go b/src/crypto/x509/x509.go
+--- a/src/crypto/x509/x509.go
++++ b/src/crypto/x509/x509.go
+@@ -782,9 +782,16 @@ type Certificate struct {
+ 	Signature          []byte
+ 	SignatureAlgorithm SignatureAlgorithm
+ 
++	// PublicKeyAlgorithm and PublicKey are UnknownPublicKeyAlgorithm and nil
++	// if the public key algorithm, or the curve of an ECDSA key, is not
++	// implemented by this package. RawSubjectPublicKeyInfo holds the key.
+ 	PublicKeyAlgorithm PublicKeyAlgorithm
+ 	PublicKey          any
+ 
++	// unsupportedCurve is set by ParseCertificate if the public key is an
++	// ECDSA key on a named curve that this package doesn't implement.
++	unsupportedCurve bool
++
+ 	Version             int
+ 	SerialNumber        *big.Int
+ 	Issuer              pkix.Name
+@@ -2048,6 +2055,9 @@ type CertificateRequest struct {
+ 	Signature          []byte
+ 	SignatureAlgorithm SignatureAlgorithm
+ 
++	// PublicKeyAlgorithm and PublicKey are UnknownPublicKeyAlgorithm and nil
++	// if the public key algorithm, or the curve of an ECDSA key, is not
++	// implemented by this package. RawSubjectPublicKeyInfo holds the key.
+ 	PublicKeyAlgorithm PublicKeyAlgorithm
+ 	PublicKey          any
+ 
+@@ -2346,6 +2356,14 @@ func CreateCertificateRequest(rand io.Reader, template *CertificateRequest, priv
+ 
+ // ParseCertificateRequest parses a single certificate request from the
+ // given ASN.1 DER data.
++//
++// If the request's public key is an ECDSA key on a named curve that this
++// package doesn't implement, its PublicKeyAlgorithm is
++// UnknownPublicKeyAlgorithm and its PublicKey is nil, as for a public key
++// algorithm this package doesn't implement, and
++// [CertificateRequest.CheckSignature] fails. This behavior can be disabled,
++// so that parsing fails, by including "x509unknowncurve=0" in the GODEBUG
++// environment variable.
+ func ParseCertificateRequest(asn1Data []byte) (*CertificateRequest, error) {
+ 	var csr certificateRequest
+ 
+@@ -2382,6 +2400,10 @@ func parseCertificateRequest(in *certificateRequest) (*CertificateRequest, error
+ 	var err error
+ 	if out.PublicKeyAlgorithm != UnknownPublicKeyAlgorithm {
+ 		out.PublicKey, err = parsePublicKey(&in.TBSCSR.PublicKey)
++		if isUnsupportedCurve(err) {
++			out.PublicKeyAlgorithm = UnknownPublicKeyAlgorithm
++			out.PublicKey, err = nil, nil
++		}
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/src/internal/godebugs/table.go b/src/internal/godebugs/table.go
+--- a/src/internal/godebugs/table.go
++++ b/src/internal/godebugs/table.go
+@@ -78,6 +78,7 @@ var All = []Info{
+ 	{Name: "x509rsacrt", Package: "crypto/x509", Changed: 24, Old: "0"},
+ 	{Name: "x509sha256skid", Package: "crypto/x509", Changed: 25, Old: "0"},
+ 	{Name: "x509sslcertoverrideplatform", Package: "crypto/x509", Changed: 27, Old: "0"},
++	{Name: "x509unknowncurve", Package: "crypto/x509"},
+ 	{Name: "x509usefallbackroots", Package: "crypto/x509"},
+ 	{Name: "x509usepolicies", Package: "crypto/x509", Changed: 24, Old: "0"},
+ 	{Name: "zipinsecurepath", Package: "archive/zip"},
+diff --git a/src/runtime/metrics/doc.go b/src/runtime/metrics/doc.go
+--- a/src/runtime/metrics/doc.go
++++ b/src/runtime/metrics/doc.go
+@@ -430,6 +430,11 @@ Below is the full list of supported metrics, ordered lexicographically.
+ 		the crypto/x509 package due to a non-default
+ 		GODEBUG=x509sslcertoverrideplatform=... setting.
+ 
++	/godebug/non-default-behavior/x509unknowncurve:events
++		The number of non-default behaviors executed by the crypto/x509
++		package due to a non-default GODEBUG=x509unknowncurve=...
++		setting.
++
+ 	/godebug/non-default-behavior/x509usefallbackroots:events
+ 		The number of non-default behaviors executed by the crypto/x509
+ 		package due to a non-default GODEBUG=x509usefallbackroots=...

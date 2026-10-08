@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ivory-overlay: build the overlay tool cmd/ivory-overlay with the go command
+# on PATH (any Go >= 1.22) and run it on this module. It fetches the pinned Go
+# release, checks it, and builds the ivory overlay or a patched GOROOT copy.
+#
+# Usage: scripts/ivory-overlay <command> [flags]
+# Run it without arguments for the list of commands, and with
+# "<command> -h" for the flags of a command.
+#
+# Environment:
+#   IVORY_CACHE   toolchains, build outputs and the tool (default: ~/.cache/ivory)
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+bin=${IVORY_CACHE:-$HOME/.cache/ivory}/bin/ivory-overlay
+
+# Build the tool itself without the overlay and build tags of an ivory env.
+GOFLAGS='' GOTOOLCHAIN=local go -C "$root/cmd/ivory-overlay" build -o "$bin" .
+IVORY_ROOT=$root exec "$bin" "$@"

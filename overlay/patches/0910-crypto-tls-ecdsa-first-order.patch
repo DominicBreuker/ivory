@@ -1,0 +1,159 @@
+crypto/tls: offer ECDHE_ECDSA suites before ECDHE_RSA suites
+
+Go fixes the order of the cipher suites a client offers and interleaves
+ECDSA and RSA suites (ECDSA-AES-128, RSA-AES-128, ECDSA-AES-256,
+RSA-AES-256), whatever the order of Config.CipherSuites. gemSpec_Krypt
+A_17124-03 (item 3) and A_17094-02 require TLS clients in the German
+health care network to offer TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 and
+TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 before any RSA suite.
+
+If Config.CipherSuites is set, as it must be in that network, which
+allows only some suites, a client now offers its ECDHE_ECDSA suites
+before its ECDHE_RSA suites of the same kind (AEAD, CBC, ...); the
+order is otherwise Go's. Without Config.CipherSuites, the default order
+is unchanged, so the recorded handshake tests keep their ClientHello.
+Servers are not changed: they choose the certificate first, and the
+suite must match its key.
+
+ivory: P7, profile kt only. Base: go1.27.2 with P0-P5 and P6.
+Requirements: A_17124-03 item 3, A_17094-02 (gemSpec_Krypt V2.51.0).
+Upstream: never. Probe: K1.
+
+diff --git a/src/crypto/tls/common.go b/src/crypto/tls/common.go
+--- a/src/crypto/tls/common.go
++++ b/src/crypto/tls/common.go
+@@ -1259,6 +1259,7 @@ func (c *Config) cipherSuites(aesGCMPreferred bool) []uint16 {
+ 		cipherSuites = slices.DeleteFunc(cipherSuites, func(id uint16) bool {
+ 			return !slices.Contains(c.CipherSuites, id)
+ 		})
++		cipherSuites = ecdsaSuitesFirst(cipherSuites)
+ 	}
+ 	if fips140tls.Required() {
+ 		cipherSuites = slices.DeleteFunc(cipherSuites, func(id uint16) bool {
+@@ -1268,6 +1269,50 @@ func (c *Config) cipherSuites(aesGCMPreferred bool) []uint16 {
+ 	return cipherSuites
+ }
+ 
++// ecdsaSuitesFirst reorders ids, a list in preference order, so that among
++// suites of the same kind the ECDHE_ECDSA suites come before the ECDHE_RSA
++// suites. The kinds are those of the preference order rules (RC4,
++// CBC_SHA256, 3DES, non-ECDHE, CBC), and the order is otherwise kept.
++// gemSpec_Krypt A_17124-03 and A_17094-02 require TLS clients in the German
++// health care network to offer the ECDHE_ECDSA suites before RSA suites;
++// such clients configure Config.CipherSuites, as the network allows only
++// some suites.
++func ecdsaSuitesFirst(ids []uint16) []uint16 {
++	kind := func(id uint16) int {
++		c, name := cipherSuiteByID(id), CipherSuiteName(id)
++		k := 0
++		if strings.Contains(name, "RC4") {
++			k |= 16
++		}
++		if strings.Contains(name, "CBC_SHA256") {
++			k |= 8
++		}
++		if strings.Contains(name, "3DES") {
++			k |= 4
++		}
++		if c.flags&suiteECDHE == 0 {
++			k |= 2
++		}
++		if c.aead == nil {
++			k |= 1
++		}
++		return k
++	}
++	rsa := func(id uint16) int {
++		if cipherSuiteByID(id).flags&suiteECSign != 0 {
++			return 0
++		}
++		return 1
++	}
++	slices.SortStableFunc(ids, func(a, b uint16) int {
++		if ka, kb := kind(a), kind(b); ka != kb {
++			return ka - kb
++		}
++		return rsa(a) - rsa(b)
++	})
++	return ids
++}
++
+ // supportedCipherSuites returns the supported TLS 1.0–1.2 cipher suites in an
+ // undefined order. For preference ordering, use [Config.cipherSuites].
+ func (c *Config) supportedCipherSuites() []uint16 {
+diff --git a/src/crypto/tls/ecdsa_first_test.go b/src/crypto/tls/ecdsa_first_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/tls/ecdsa_first_test.go
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"slices"
++	"testing"
++)
++
++// TestECDSASuitesFirst checks that a client with Config.CipherSuites offers
++// its ECDHE_ECDSA suites before its ECDHE_RSA suites of the same kind, as
++// gemSpec_Krypt A_17124-03 and A_17094-02 require, whatever the order of
++// Config.CipherSuites.
++func TestECDSASuitesFirst(t *testing.T) {
++	for _, tt := range []struct {
++		name   string
++		suites []uint16
++		want   []uint16
++	}{
++		{"TI suites, RSA first", []uint16{
++			TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++			TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++		}, []uint16{
++			TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
++			TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
++		}},
++		{"AEAD before CBC", []uint16{
++			TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
++			TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, TLS_RSA_WITH_AES_128_GCM_SHA256,
++			TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
++		}, []uint16{
++			TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
++			TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA, TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
++			TLS_RSA_WITH_AES_128_GCM_SHA256,
++		}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			for _, aes := range []bool{true, false} {
++				got := (&Config{CipherSuites: tt.suites}).cipherSuites(aes)
++				if !slices.Equal(got, tt.want) {
++					t.Errorf("cipherSuites(%v) = %x, want %x", aes, got, tt.want)
++				}
++			}
++
++			var hello []uint16
++			serverConfig := testConfigServer.Clone()
++			serverConfig.GetConfigForClient = func(chi *ClientHelloInfo) (*Config, error) {
++				hello = slices.Clone(chi.CipherSuites)
++				return nil, nil
++			}
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MaxVersion = VersionTLS12
++			clientConfig.CipherSuites = tt.suites
++			serverConfig.CipherSuites = tt.suites
++			if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++				t.Fatal(err)
++			}
++			hello = slices.DeleteFunc(hello, func(id uint16) bool { return id == scsvRenegotiation })
++			if !slices.Equal(hello, tt.want) {
++				t.Errorf("ClientHello cipher_suites = %x, want %x", hello, tt.want)
++			}
++		})
++	}
++
++	// Without Config.CipherSuites, the default order is unchanged.
++	if got, want := (&Config{}).cipherSuites(true), defaultCipherSuites(true); !slices.Equal(got, want) {
++		t.Errorf("default cipherSuites = %x, want %x", got, want)
++	}
++}

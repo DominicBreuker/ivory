@@ -1,0 +1,872 @@
+crypto/tls: verify peer signatures by keys this package doesn't support
+
+A peer whose leaf certificate has a public key that crypto/tls doesn't
+support (x509.Certificate.PublicKey is nil), such as an ECDSA key on a
+named curve that crypto/x509 doesn't implement, is rejected with an
+unsupported_certificate alert before VerifyPeerCertificate and
+VerifyConnection run. Applications can verify the certificate chain
+themselves, but they have no way to verify the peer's handshake
+signature.
+
+Add Config.VerifyUnsupportedSignature. If it is set, such peers are
+accepted in TLS 1.2 and TLS 1.3, and their ServerKeyExchange and
+CertificateVerify signatures are passed to it. Before that, crypto/tls checks what it
+checks for supported keys: the signature scheme must be one it
+advertised, and in a ServerKeyExchange its signature algorithm must
+match the cipher suite (an ECDSA scheme on an ECDHE_ECDSA suite, an RSA
+scheme on an ECDHE_RSA suite). The alerts are unchanged: an invalid
+ServerKeyExchange draws illegal_parameter from the client, a
+CertificateVerify with a scheme that was not advertised draws
+illegal_parameter, and a bad CertificateVerify signature draws
+decrypt_error from the server. The hook is never called for supported
+keys. Unset, behavior is unchanged. It is off in FIPS 140-3 mode.
+
+In TLS 1.3, the signature schemes this package implements are bound to
+public key types it supports (an ECDSA scheme to its curve), so a peer
+with an unsupported key must sign with a scheme this package doesn't
+implement, and that it advertised; others draw illegal_parameter, as
+for a supported key that uses the wrong scheme. The function gets the
+TLS 1.3 signed content (RFC 8446, Section 4.4.3). Such schemes are only
+advertised by a later change that makes the list configurable; until
+then, unsupported keys still fail in TLS 1.3.
+
+The tests use a certificate whose key names a made-up curve OID but holds
+a P-256 point, and a hook that verifies with crypto/ecdsa. Schemes that
+were not advertised, or that don't match the suite, are produced by a
+connection wrapper that rewrites the peer's handshake message.
+
+ivory: P2, profiles core and kt. Base: go1.27.2 with P0 and P1.
+Upstream: proposal B. Requirements: A_17124-03, A_22455, A_22890
+(gemSpec_Krypt V2.51.0, gemSpec_KT V3.17.1).
+Status: TLS 1.2 and TLS 1.3. The TLS 1.3 hook path
+is tested end to end with P3 (opaque signers) and P5 (signature schemes).
+
+diff --git a/src/crypto/tls/auth.go b/src/crypto/tls/auth.go
+--- a/src/crypto/tls/auth.go
++++ b/src/crypto/tls/auth.go
+@@ -12,6 +12,7 @@ import (
+ 	"crypto/elliptic"
+ 	"crypto/mldsa"
+ 	"crypto/rsa"
++	"crypto/x509"
+ 	"errors"
+ 	"fmt"
+ 	"hash"
+@@ -77,6 +78,32 @@ func verifyHandshakeSignature(sigType uint8, pubkey crypto.PublicKey, hashFunc c
+ 	return nil
+ }
+ 
++// verifyPeerHandshakeSignature verifies a TLS 1.2 or TLS 1.3 handshake
++// signature made by the peer's leaf certificate. If this package doesn't
++// support its public key, it calls Config.VerifyUnsupportedSignature.
++func verifyPeerHandshakeSignature(config *Config, vers uint16, leaf *x509.Certificate, scheme SignatureScheme, sigType uint8, hashFunc crypto.Hash, signed, sig []byte) error {
++	if leaf.PublicKey == nil {
++		if !config.supportsUnsupportedPeerKey(vers) {
++			return errors.New("unsupported public key")
++		}
++		return config.VerifyUnsupportedSignature(leaf, scheme, signed, sig)
++	}
++	return verifyHandshakeSignature(sigType, leaf.PublicKey, hashFunc, signed, sig)
++}
++
++// isPeerSignatureSchemeTLS13 reports whether the peer's leaf certificate may
++// sign a TLS 1.3 CertificateVerify with scheme. The schemes this package
++// implements are bound to public key types that it supports (ECDSA schemes
++// to a curve), so a key that it doesn't support may only use other schemes,
++// which Config.VerifyUnsupportedSignature verifies.
++func isPeerSignatureSchemeTLS13(leaf *x509.Certificate, scheme SignatureScheme) bool {
++	if leaf.PublicKey == nil {
++		_, _, err := typeAndHashFromSignatureScheme(scheme)
++		return err != nil
++	}
++	return isSupportedSignatureAlgorithm(scheme, signatureSchemesForPublicKey(VersionTLS13, leaf.PublicKey))
++}
++
+ // verifyLegacyHandshakeSignature verifies a TLS 1.0 and 1.1 signature against
+ // pre-hashed handshake contents.
+ func verifyLegacyHandshakeSignature(sigType uint8, pubkey crypto.PublicKey, hashFunc crypto.Hash, hashed, sig []byte) error {
+diff --git a/src/crypto/tls/common.go b/src/crypto/tls/common.go
+--- a/src/crypto/tls/common.go
++++ b/src/crypto/tls/common.go
+@@ -691,6 +691,29 @@ type Config struct {
+ 	// settings.
+ 	VerifyConnection func(ConnectionState) error
+ 
++	// VerifyUnsupportedSignature, if not nil, is called to verify a
++	// handshake signature (ServerKeyExchange or CertificateVerify) made by
++	// the peer when the public key in the peer's leaf certificate is not
++	// supported by this package, that is, when leaf.PublicKey is nil.
++	// signed is the signed message, before hashing; in TLS 1.3, it is the
++	// content defined in RFC 8446, Section 4.4.3. scheme is one that this
++	// package advertised. In TLS 1.2, for a ServerKeyExchange, its signature
++	// algorithm matches the cipher suite. In TLS 1.3, it is a scheme that
++	// this package doesn't implement, because the ones it implements are
++	// bound to public key types it supports. The function must check that
++	// scheme is valid for the key, apply the hash that scheme defines, and
++	// verify sig. If it returns an error, the handshake fails as for an
++	// invalid signature by a supported key. It is never called for keys
++	// this package supports.
++	//
++	// If VerifyUnsupportedSignature is nil, connections with such peers
++	// fail. They also fail before TLS 1.2 and in FIPS 140-3 mode. Certificate
++	// verification is unchanged: the default verifier rejects such
++	// certificates, so verify them in VerifyConnection with
++	// InsecureSkipVerify set (or with ClientAuth set to RequireAnyClientCert
++	// or RequestClientCert), as in the VerifyConnection example.
++	VerifyUnsupportedSignature func(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error
++
+ 	// RootCAs defines the set of root certificate authorities
+ 	// that clients use when verifying server certificates.
+ 	// If RootCAs is nil, TLS uses the host's root CA set.
+@@ -1023,6 +1046,7 @@ func (c *Config) Clone() *Config {
+ 		GetEncryptedClientHelloKeys:         c.GetEncryptedClientHelloKeys,
+ 		VerifyPeerCertificate:               c.VerifyPeerCertificate,
+ 		VerifyConnection:                    c.VerifyConnection,
++		VerifyUnsupportedSignature:          c.VerifyUnsupportedSignature,
+ 		RootCAs:                             c.RootCAs,
+ 		NextProtos:                          c.NextProtos,
+ 		ServerName:                          c.ServerName,
+@@ -1278,6 +1302,13 @@ func supportedVersionsFromMax(maxVersion uint16) []uint16 {
+ 	return versions
+ }
+ 
++// supportsUnsupportedPeerKey reports whether a peer certificate whose public
++// key this package doesn't support may be used in a connection of version
++// vers, with VerifyUnsupportedSignature.
++func (c *Config) supportsUnsupportedPeerKey(vers uint16) bool {
++	return c.VerifyUnsupportedSignature != nil && vers >= VersionTLS12 && !fips140tls.Required()
++}
++
+ func (c *Config) curvePreferences(version uint16) []CurveID {
+ 	return slices.DeleteFunc(curvePreferenceOrder(), func(x CurveID) bool {
+ 		return !c.supportsCurve(version, x)
+diff --git a/src/crypto/tls/handshake_client.go b/src/crypto/tls/handshake_client.go
+--- a/src/crypto/tls/handshake_client.go
++++ b/src/crypto/tls/handshake_client.go
+@@ -1182,6 +1182,9 @@ func (c *Conn) verifyServerCertificate(certificates [][]byte) error {
+ 			return errors.New("tls: server's certificate uses ML-DSA, which requires TLS 1.3")
+ 		}
+ 	default:
++		if certs[0].PublicKey == nil && c.config.supportsUnsupportedPeerKey(c.vers) {
++			break // see Config.VerifyUnsupportedSignature
++		}
+ 		c.sendAlert(alertUnsupportedCertificate)
+ 		return fmt.Errorf("tls: server's certificate contains an unsupported type of public key: %T", certs[0].PublicKey)
+ 	}
+diff --git a/src/crypto/tls/handshake_client_tls13.go b/src/crypto/tls/handshake_client_tls13.go
+--- a/src/crypto/tls/handshake_client_tls13.go
++++ b/src/crypto/tls/handshake_client_tls13.go
+@@ -655,20 +655,20 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
+ 	// We don't use hs.hello.supportedSignatureAlgorithms because it might
+ 	// include PKCS#1 v1.5 and SHA-1 if the ClientHello also supported TLS 1.2.
+ 	if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms(c.vers, c.vers)) ||
+-		!isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, signatureSchemesForPublicKey(c.vers, c.peerCertificates[0].PublicKey)) {
++		!isPeerSignatureSchemeTLS13(c.peerCertificates[0], certVerify.signatureAlgorithm) {
+ 		c.sendAlert(alertIllegalParameter)
+ 		return errors.New("tls: certificate used with invalid signature algorithm")
+ 	}
+ 	sigType, sigHash, err := typeAndHashFromSignatureScheme(certVerify.signatureAlgorithm)
+-	if err != nil {
++	if err != nil && c.peerCertificates[0].PublicKey != nil {
+ 		return c.sendAlert(alertInternalError)
+ 	}
+ 	if sigType == signaturePKCS1v15 || sigHash == crypto.SHA1 {
+ 		return c.sendAlert(alertInternalError)
+ 	}
+ 	signed := signedMessage(serverSignatureContext, hs.transcript)
+-	if err := verifyHandshakeSignature(sigType, c.peerCertificates[0].PublicKey,
+-		sigHash, signed, certVerify.signature); err != nil {
++	if err := verifyPeerHandshakeSignature(c.config, c.vers, c.peerCertificates[0],
++		certVerify.signatureAlgorithm, sigType, sigHash, signed, certVerify.signature); err != nil {
+ 		c.sendAlert(alertDecryptError)
+ 		return errors.New("tls: invalid signature by the server certificate: " + err.Error())
+ 	}
+diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_server.go
+--- a/src/crypto/tls/handshake_server.go
++++ b/src/crypto/tls/handshake_server.go
+@@ -792,7 +792,7 @@ func (hs *serverHandshakeState) doFullHandshake() error {
+ 				c.sendAlert(alertInternalError)
+ 				return errors.New("tls: internal error: did not keep handshake transcript for TLS 1.2")
+ 			}
+-			if err := verifyHandshakeSignature(sigType, pub, sigHash, hs.finishedHash.buffer, certVerify.signature); err != nil {
++			if err := verifyPeerHandshakeSignature(c.config, c.vers, c.peerCertificates[0], certVerify.signatureAlgorithm, sigType, sigHash, hs.finishedHash.buffer, certVerify.signature); err != nil {
+ 				c.sendAlert(alertDecryptError)
+ 				return errors.New("tls: invalid signature by the client certificate: " + err.Error())
+ 			}
+@@ -1011,6 +1011,9 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
+ 				return errors.New("tls: client certificate uses ML-DSA, which requires TLS 1.3")
+ 			}
+ 		default:
++			if certs[0].PublicKey == nil && c.config.supportsUnsupportedPeerKey(c.vers) {
++				break // see Config.VerifyUnsupportedSignature
++			}
+ 			c.sendAlert(alertUnsupportedCertificate)
+ 			return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
+ 		}
+diff --git a/src/crypto/tls/handshake_server_tls13.go b/src/crypto/tls/handshake_server_tls13.go
+--- a/src/crypto/tls/handshake_server_tls13.go
++++ b/src/crypto/tls/handshake_server_tls13.go
+@@ -1086,20 +1086,20 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
+ 		// We don't use certReq.supportedSignatureAlgorithms because it would
+ 		// require keeping the certificateRequestMsgTLS13 around in the hs.
+ 		if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms(c.vers, c.vers)) ||
+-			!isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, signatureSchemesForPublicKey(c.vers, c.peerCertificates[0].PublicKey)) {
++			!isPeerSignatureSchemeTLS13(c.peerCertificates[0], certVerify.signatureAlgorithm) {
+ 			c.sendAlert(alertIllegalParameter)
+ 			return errors.New("tls: client certificate used with invalid signature algorithm")
+ 		}
+ 		sigType, sigHash, err := typeAndHashFromSignatureScheme(certVerify.signatureAlgorithm)
+-		if err != nil {
++		if err != nil && c.peerCertificates[0].PublicKey != nil {
+ 			return c.sendAlert(alertInternalError)
+ 		}
+ 		if sigType == signaturePKCS1v15 || sigHash == crypto.SHA1 {
+ 			return c.sendAlert(alertInternalError)
+ 		}
+ 		signed := signedMessage(clientSignatureContext, hs.transcript)
+-		if err := verifyHandshakeSignature(sigType, c.peerCertificates[0].PublicKey,
+-			sigHash, signed, certVerify.signature); err != nil {
++		if err := verifyPeerHandshakeSignature(c.config, c.vers, c.peerCertificates[0],
++			certVerify.signatureAlgorithm, sigType, sigHash, signed, certVerify.signature); err != nil {
+ 			c.sendAlert(alertDecryptError)
+ 			return errors.New("tls: invalid signature by the client certificate: " + err.Error())
+ 		}
+diff --git a/src/crypto/tls/key_agreement.go b/src/crypto/tls/key_agreement.go
+--- a/src/crypto/tls/key_agreement.go
++++ b/src/crypto/tls/key_agreement.go
+@@ -352,7 +352,7 @@ func (ka *ecdheKeyAgreement) processServerKeyExchange(config *Config, clientHell
+ 			return errServerKeyExchange
+ 		}
+ 		signed := slices.Concat(clientHello.random, serverHello.random, serverECDHEParams)
+-		if err := verifyHandshakeSignature(sigType, cert.PublicKey, sigHash, signed, sig); err != nil {
++		if err := verifyPeerHandshakeSignature(config, ka.version, cert, ka.signatureAlgorithm, sigType, sigHash, signed, sig); err != nil {
+ 			return errors.New("tls: invalid signature by the server certificate: " + err.Error())
+ 		}
+ 	} else {
+diff --git a/src/crypto/tls/tls_test.go b/src/crypto/tls/tls_test.go
+--- a/src/crypto/tls/tls_test.go
++++ b/src/crypto/tls/tls_test.go
+@@ -879,7 +879,7 @@ func TestWarningAlertFlood(t *testing.T) {
+ }
+ 
+ func TestCloneFuncFields(t *testing.T) {
+-	const expectedCount = 10
++	const expectedCount = 11
+ 	called := 0
+ 
+ 	c1 := Config{
+@@ -923,6 +923,10 @@ func TestCloneFuncFields(t *testing.T) {
+ 			called |= 1 << 9
+ 			return nil, nil
+ 		},
++		VerifyUnsupportedSignature: func(*x509.Certificate, SignatureScheme, []byte, []byte) error {
++			called |= 1 << 10
++			return nil
++		},
+ 	}
+ 
+ 	c2 := c1.Clone()
+@@ -937,6 +941,7 @@ func TestCloneFuncFields(t *testing.T) {
+ 	c2.WrapSession(ConnectionState{}, nil)
+ 	c2.EncryptedClientHelloRejectionVerify(ConnectionState{})
+ 	c2.GetEncryptedClientHelloKeys(nil)
++	c2.VerifyUnsupportedSignature(nil, 0, nil, nil)
+ 
+ 	if called != (1<<expectedCount)-1 {
+ 		t.Fatalf("expected %d calls but saw calls %b", expectedCount, called)
+@@ -955,7 +960,7 @@ func TestCloneNonFuncFields(t *testing.T) {
+ 		switch fn := typ.Field(i).Name; fn {
+ 		case "Rand":
+ 			f.Set(reflect.ValueOf(io.Reader(os.Stdin)))
+-		case "Time", "GetCertificate", "GetConfigForClient", "VerifyPeerCertificate", "VerifyConnection", "GetClientCertificate", "WrapSession", "UnwrapSession", "EncryptedClientHelloRejectionVerify", "GetEncryptedClientHelloKeys":
++		case "Time", "GetCertificate", "GetConfigForClient", "VerifyPeerCertificate", "VerifyConnection", "GetClientCertificate", "WrapSession", "UnwrapSession", "EncryptedClientHelloRejectionVerify", "GetEncryptedClientHelloKeys", "VerifyUnsupportedSignature":
+ 			// DeepEqual can't compare functions. If you add a
+ 			// function field to this list, you must also change
+ 			// TestCloneFuncFields to ensure that the func field is
+diff --git a/src/crypto/tls/unsupported_key_test.go b/src/crypto/tls/unsupported_key_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/tls/unsupported_key_test.go
+@@ -0,0 +1,582 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"crypto"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"crypto/x509/pkix"
++	"encoding/asn1"
++	"errors"
++	"math/big"
++	"net"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	"golang.org/x/crypto/cryptobyte"
++	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"
++)
++
++// oidUnsupportedCurve names an elliptic curve that this package doesn't
++// support. It is under the enterprise number reserved for documentation
++// (RFC 5612). Certificates with it carry a P-256 point, so tests can sign
++// and verify with crypto/ecdsa.
++var oidUnsupportedCurve = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 32473, 1}
++
++var oidPublicKeyECDSA = asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
++
++// unsupportedKeyCertificate returns a certificate and key for a peer whose
++// public key this package doesn't support (x509.Certificate.PublicKey is
++// nil), and a pool with the CA that issued it.
++func unsupportedKeyCertificate(t *testing.T, cn string) (Certificate, *x509.CertPool) {
++	t.Helper()
++	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	caTmpl := &x509.Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "unsupported key CA"},
++		NotBefore:             testTime().Add(-time.Hour),
++		NotAfter:              testTime().Add(time.Hour),
++		KeyUsage:              x509.KeyUsageCertSign,
++		BasicConstraintsValid: true,
++		IsCA:                  true,
++	}
++	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, caKey.Public(), caKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ca, err := x509.ParseCertificate(caDER)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tmpl := &x509.Certificate{
++		SerialNumber:       big.NewInt(2),
++		Subject:            pkix.Name{CommonName: cn},
++		DNSNames:           []string{cn},
++		NotBefore:          testTime().Add(-time.Hour),
++		NotAfter:           testTime().Add(time.Hour),
++		KeyUsage:           x509.KeyUsageDigitalSignature,
++		ExtKeyUsage:        []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
++		SignatureAlgorithm: x509.ECDSAWithSHA256,
++	}
++	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, key.Public(), caKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := x509.ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Replace the curve OID in the subjectPublicKeyInfo, the seventh field
++	// of the TBSCertificate, and sign again.
++	point, err := key.PublicKey.Bytes()
++	if err != nil {
++		t.Fatal(err)
++	}
++	var spki cryptobyte.Builder
++	spki.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		b.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++			b.AddASN1ObjectIdentifier(oidPublicKeyECDSA)
++			b.AddASN1ObjectIdentifier(oidUnsupportedCurve)
++		})
++		b.AddASN1BitString(point)
++	})
++	in := cryptobyte.String(cert.RawTBSCertificate)
++	if !in.ReadASN1(&in, cryptobyte_asn1.SEQUENCE) {
++		t.Fatal("malformed TBSCertificate")
++	}
++	var tbs cryptobyte.Builder
++	tbs.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		for i := 0; !in.Empty(); i++ {
++			var field cryptobyte.String
++			if !in.ReadAnyASN1Element(&field, nil) {
++				t.Fatal("malformed TBSCertificate")
++			}
++			if i == 6 {
++				field = spki.BytesOrPanic()
++			}
++			b.AddBytes(field)
++		}
++	})
++	tbsDER := tbs.BytesOrPanic()
++	h := crypto.SHA256.New()
++	h.Write(tbsDER)
++	sig, err := ecdsa.SignASN1(rand.Reader, caKey, h.Sum(nil))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var out cryptobyte.Builder
++	out.AddASN1(cryptobyte_asn1.SEQUENCE, func(b *cryptobyte.Builder) {
++		b.AddBytes(tbsDER)
++		b.AddBytes(cert.RawSignatureAlgorithm)
++		b.AddASN1BitString(sig)
++	})
++	leafDER := out.BytesOrPanic()
++
++	leaf, err := x509.ParseCertificate(leafDER)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if leaf.PublicKey != nil {
++		t.Fatalf("test certificate has a supported %T key", leaf.PublicKey)
++	}
++	if err := leaf.CheckSignatureFrom(ca); err != nil {
++		t.Fatal(err)
++	}
++	pool := x509.NewCertPool()
++	pool.AddCert(ca)
++	return Certificate{Certificate: [][]byte{leafDER}, PrivateKey: key}, pool
++}
++
++// verifyUnsupportedCurveSignature is a Config.VerifyUnsupportedSignature
++// for certificates made by unsupportedKeyCertificate.
++func verifyUnsupportedCurveSignature(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error {
++	var alg, curve asn1.ObjectIdentifier
++	var point asn1.BitString
++	spki := cryptobyte.String(leaf.RawSubjectPublicKeyInfo)
++	var algID cryptobyte.String
++	if !spki.ReadASN1(&spki, cryptobyte_asn1.SEQUENCE) ||
++		!spki.ReadASN1(&algID, cryptobyte_asn1.SEQUENCE) ||
++		!algID.ReadASN1ObjectIdentifier(&alg) ||
++		!algID.ReadASN1ObjectIdentifier(&curve) ||
++		!spki.ReadASN1BitString(&point) {
++		return errors.New("malformed subjectPublicKeyInfo")
++	}
++	if !alg.Equal(oidPublicKeyECDSA) || !curve.Equal(oidUnsupportedCurve) {
++		return errors.New("unexpected key type")
++	}
++	pub, err := ecdsa.ParseUncompressedPublicKey(elliptic.P256(), point.RightAlign())
++	if err != nil {
++		return err
++	}
++	var h crypto.Hash
++	switch scheme {
++	case ECDSAWithP256AndSHA256:
++		h = crypto.SHA256
++	case ECDSAWithP384AndSHA384:
++		h = crypto.SHA384
++	case ECDSAWithP521AndSHA512:
++		h = crypto.SHA512
++	default:
++		return errors.New("unsupported signature scheme")
++	}
++	hh := h.New()
++	hh.Write(signed)
++	if !ecdsa.VerifyASN1(pub, hh.Sum(nil), sig) {
++		return errors.New("ECDSA verification failure")
++	}
++	return nil
++}
++
++type unsupportedKeyTest struct {
++	name        string
++	version     uint16
++	hook        func(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error
++	clientErr   string // substring of the client's error; "" for success
++	serverErr   string // substring of the server's error; "" for success
++	wantHookRun bool
++}
++
++var errTestHook = errors.New("test hook rejects the signature")
++
++func unsupportedKeyTests() []unsupportedKeyTest {
++	return []unsupportedKeyTest{
++		{
++			name:    "no hook",
++			version: VersionTLS12,
++		},
++		{
++			name:        "hook",
++			version:     VersionTLS12,
++			hook:        verifyUnsupportedCurveSignature,
++			wantHookRun: true,
++		},
++		{
++			name:    "hook fails",
++			version: VersionTLS12,
++			hook: func(*x509.Certificate, SignatureScheme, []byte, []byte) error {
++				return errTestHook
++			},
++			wantHookRun: true,
++		},
++		{
++			name:    "TLS 1.3 no hook",
++			version: VersionTLS13,
++		},
++		{
++			// In TLS 1.3, ECDSAWithP256AndSHA256 is bound to P-256, so a
++			// key that this package doesn't support can't use it.
++			name:    "TLS 1.3 implemented scheme",
++			version: VersionTLS13,
++			hook:    verifyUnsupportedCurveSignature,
++		},
++	}
++}
++
++func TestVerifyUnsupportedSignatureServerCertificate(t *testing.T) {
++	cert, pool := unsupportedKeyCertificate(t, "server.example")
++	for _, tt := range unsupportedKeyTests() {
++		t.Run(tt.name, func(t *testing.T) {
++			var hookRuns int
++			var gotScheme SignatureScheme
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MinVersion = tt.version
++			clientConfig.MaxVersion = tt.version
++			clientConfig.InsecureSkipVerify = true
++			clientConfig.VerifyConnection = func(cs ConnectionState) error {
++				// The certificate chain is verified as usual.
++				opts := x509.VerifyOptions{Roots: pool, CurrentTime: testTime()}
++				_, err := cs.PeerCertificates[0].Verify(opts)
++				if err == nil || !strings.Contains(err.Error(), "unsupported elliptic curve") {
++					t.Errorf("Verify: err = %v, want an unsupported curve error", err)
++				}
++				return nil
++			}
++			if tt.hook != nil {
++				clientConfig.VerifyUnsupportedSignature = func(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error {
++					hookRuns++
++					gotScheme = scheme
++					if leaf.Subject.CommonName != "server.example" {
++						t.Errorf("leaf.Subject.CommonName = %q", leaf.Subject.CommonName)
++					}
++					return tt.hook(leaf, scheme, signed, sig)
++				}
++			}
++			serverConfig := testConfigServer.Clone()
++			serverConfig.Certificates = []Certificate{cert}
++			serverConfig.MaxVersion = tt.version
++
++			clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++			switch {
++			case tt.name == "hook":
++				if clientErr != nil || serverErr != nil {
++					t.Fatalf("handshake failed: client: %v, server: %v", clientErr, serverErr)
++				}
++				if gotScheme != ECDSAWithP256AndSHA256 {
++					t.Errorf("scheme = %v, want %v", gotScheme, ECDSAWithP256AndSHA256)
++				}
++			case tt.name == "hook fails":
++				if clientErr == nil || !errors.Is(clientErr, errTestHook) && !strings.Contains(clientErr.Error(), errTestHook.Error()) {
++					t.Errorf("client error = %v, want %v", clientErr, errTestHook)
++				}
++				if serverErr == nil || !strings.Contains(serverErr.Error(), "illegal parameter") {
++					t.Errorf("server error = %v, want an illegal_parameter alert", serverErr)
++				}
++			case tt.name == "TLS 1.3 implemented scheme":
++				if clientErr == nil || !strings.Contains(clientErr.Error(), "invalid signature algorithm") {
++					t.Errorf("client error = %v, want an invalid signature algorithm error", clientErr)
++				}
++				if serverErr == nil || !strings.Contains(serverErr.Error(), "illegal parameter") {
++					t.Errorf("server error = %v, want an illegal_parameter alert", serverErr)
++				}
++			default:
++				if clientErr == nil || !strings.Contains(clientErr.Error(), "unsupported type of public key") {
++					t.Errorf("client error = %v, want an unsupported public key error", clientErr)
++				}
++				if serverErr == nil || !strings.Contains(serverErr.Error(), "unsupported certificate") {
++					t.Errorf("server error = %v, want an unsupported_certificate alert", serverErr)
++				}
++			}
++			if wantRuns := map[bool]int{true: 1, false: 0}[tt.wantHookRun]; hookRuns != wantRuns {
++				t.Errorf("hook ran %d times, want %d", hookRuns, wantRuns)
++			}
++		})
++	}
++}
++
++func TestVerifyUnsupportedSignatureClientCertificate(t *testing.T) {
++	cert, pool := unsupportedKeyCertificate(t, "client.example")
++	for _, tt := range unsupportedKeyTests() {
++		t.Run(tt.name, func(t *testing.T) {
++			var hookRuns int
++			var gotScheme SignatureScheme
++			serverConfig := testConfigServer.Clone()
++			serverConfig.MaxVersion = tt.version
++			serverConfig.ClientAuth = RequireAnyClientCert
++			serverConfig.ClientCAs = pool // sent as the acceptable CAs
++			serverConfig.VerifyConnection = func(cs ConnectionState) error {
++				opts := x509.VerifyOptions{Roots: pool, CurrentTime: testTime(), KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
++				if _, err := cs.PeerCertificates[0].Verify(opts); err == nil {
++					t.Error("Verify succeeded for a certificate with an unsupported key")
++				}
++				return nil
++			}
++			if tt.hook != nil {
++				serverConfig.VerifyUnsupportedSignature = func(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error {
++					hookRuns++
++					gotScheme = scheme
++					return tt.hook(leaf, scheme, signed, sig)
++				}
++			}
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MinVersion = tt.version
++			clientConfig.MaxVersion = tt.version
++			clientConfig.Certificates = []Certificate{cert}
++
++			clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++			switch {
++			case tt.name == "hook":
++				if clientErr != nil || serverErr != nil {
++					t.Fatalf("handshake failed: client: %v, server: %v", clientErr, serverErr)
++				}
++				if gotScheme != ECDSAWithP256AndSHA256 {
++					t.Errorf("scheme = %v, want %v", gotScheme, ECDSAWithP256AndSHA256)
++				}
++			case tt.name == "hook fails":
++				if serverErr == nil || !strings.Contains(serverErr.Error(), errTestHook.Error()) {
++					t.Errorf("server error = %v, want %v", serverErr, errTestHook)
++				}
++				if clientErr == nil || !strings.Contains(clientErr.Error(), "error decrypting message") {
++					t.Errorf("client error = %v, want a decrypt_error alert", clientErr)
++				}
++			case tt.name == "TLS 1.3 implemented scheme":
++				// The client learns about the alert only after its handshake.
++				if serverErr == nil || !strings.Contains(serverErr.Error(), "invalid signature algorithm") {
++					t.Errorf("server error = %v, want an invalid signature algorithm error", serverErr)
++				}
++			case tt.version == VersionTLS13:
++				if serverErr == nil || !strings.Contains(serverErr.Error(), "unsupported public key") {
++					t.Errorf("server error = %v, want an unsupported public key error", serverErr)
++				}
++			default:
++				if serverErr == nil || !strings.Contains(serverErr.Error(), "unsupported public key") {
++					t.Errorf("server error = %v, want an unsupported public key error", serverErr)
++				}
++				if clientErr == nil || !strings.Contains(clientErr.Error(), "unsupported certificate") {
++					t.Errorf("client error = %v, want an unsupported_certificate alert", clientErr)
++				}
++			}
++			if wantRuns := map[bool]int{true: 1, false: 0}[tt.wantHookRun]; hookRuns != wantRuns {
++				t.Errorf("hook ran %d times, want %d", hookRuns, wantRuns)
++			}
++		})
++	}
++}
++
++// TestVerifyUnsupportedSignatureNoClientCertificate checks that a server
++// with the hook still accepts clients without a certificate.
++func TestVerifyUnsupportedSignatureNoClientCertificate(t *testing.T) {
++	serverConfig := testConfigServer.Clone()
++	serverConfig.MaxVersion = VersionTLS12
++	serverConfig.ClientAuth = RequestClientCert
++	serverConfig.VerifyUnsupportedSignature = func(*x509.Certificate, SignatureScheme, []byte, []byte) error {
++		t.Error("hook called without a client certificate")
++		return errTestHook
++	}
++	clientConfig := testConfigClient.Clone()
++	clientConfig.Certificates = nil
++	if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestVerifyUnsupportedSignatureFIPS(t *testing.T) {
++	cert, _ := unsupportedKeyCertificate(t, "server.example")
++	runWithFIPSEnabled(t, func(t *testing.T) {
++		clientConfig := testConfigClient.Clone()
++		clientConfig.MaxVersion = VersionTLS12
++		clientConfig.InsecureSkipVerify = true
++		clientConfig.VerifyUnsupportedSignature = func(*x509.Certificate, SignatureScheme, []byte, []byte) error {
++			t.Error("hook called in FIPS 140-3 mode")
++			return nil
++		}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.Certificates = []Certificate{cert}
++		clientErr, _ := fipsHandshake(t, clientConfig, serverConfig)
++		if clientErr == nil || !strings.Contains(clientErr.Error(), "unsupported type of public key") {
++			t.Errorf("client error = %v, want an unsupported public key error", clientErr)
++		}
++	})
++}
++
++// rewriteHandshakeConn is a net.Conn that lets a test change the handshake
++// messages of one type that it writes, as an attacker could. This package
++// writes each handshake message in its own records, and the messages before
++// ChangeCipherSpec in TLS 1.2 are not encrypted.
++type rewriteHandshakeConn struct {
++	net.Conn
++	typ     uint8
++	rewrite func(msg []byte) // the message body, after the 4-byte header
++}
++
++func (c *rewriteHandshakeConn) Write(b []byte) (int, error) {
++	out := slices.Clone(b)
++	for rec := out; len(rec) > recordHeaderLen; {
++		n := recordHeaderLen + (int(rec[3])<<8 | int(rec[4]))
++		if n > len(rec) {
++			break
++		}
++		if recordType(rec[0]) == recordTypeHandshake && rec[recordHeaderLen] == c.typ {
++			c.rewrite(rec[recordHeaderLen+4 : n])
++		}
++		rec = rec[n:]
++	}
++	if _, err := c.Conn.Write(out); err != nil {
++		return 0, err
++	}
++	return len(b), nil
++}
++
++// handshakeWithRewrite runs a handshake in which the handshake messages of
++// type typ, written by the server (or the client if fromClient is set), are
++// changed by rewrite.
++func handshakeWithRewrite(t *testing.T, clientConfig, serverConfig *Config, fromClient bool, typ uint8, rewrite func([]byte)) (clientErr, serverErr error) {
++	c, s := localPipe(t)
++	var cc, sc net.Conn = c, s
++	if fromClient {
++		cc = &rewriteHandshakeConn{Conn: c, typ: typ, rewrite: rewrite}
++	} else {
++		sc = &rewriteHandshakeConn{Conn: s, typ: typ, rewrite: rewrite}
++	}
++	done := make(chan error, 1)
++	go func() {
++		done <- Client(cc, clientConfig).Handshake()
++		c.Close()
++	}()
++	serverErr = Server(sc, serverConfig).Handshake()
++	s.Close()
++	clientErr = <-done
++	return
++}
++
++// TestVerifyUnsupportedSignatureServerKeyExchangeScheme checks that the
++// signature scheme of a ServerKeyExchange by a server with an unsupported key
++// is checked before the hook is called: it must be one the client advertised,
++// and its signature algorithm must match the cipher suite.
++func TestVerifyUnsupportedSignatureServerKeyExchangeScheme(t *testing.T) {
++	cert, _ := unsupportedKeyCertificate(t, "server.example")
++	rsaCert := Certificate{Certificate: cert.Certificate, PrivateKey: testRSA2048Cert.PrivateKey}
++	const notAdvertised SignatureScheme = 0xfe01 // private use (RFC 8446)
++	for _, tt := range []struct {
++		name      string
++		cert      Certificate
++		suite     uint16
++		scheme    SignatureScheme // replaces the server's scheme; 0 keeps it
++		clientErr string
++	}{
++		{"ECDSA suite and scheme", cert, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, 0, ""},
++		{"not advertised", cert, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, notAdvertised, "invalid signature algorithm"},
++		{"RSA scheme on an ECDSA suite", cert, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, PKCS1WithSHA256, "invalid ServerKeyExchange"},
++		{"RSA-PSS scheme on an ECDSA suite", cert, TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, PSSWithSHA256, "invalid ServerKeyExchange"},
++		{"ECDSA scheme on an RSA suite", rsaCert, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, ECDSAWithP256AndSHA256, "invalid ServerKeyExchange"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			var hookRuns int
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MaxVersion = VersionTLS12
++			clientConfig.CipherSuites = []uint16{tt.suite}
++			clientConfig.InsecureSkipVerify = true
++			clientConfig.VerifyUnsupportedSignature = func(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error {
++				hookRuns++
++				return verifyUnsupportedCurveSignature(leaf, scheme, signed, sig)
++			}
++			serverConfig := testConfigServer.Clone()
++			serverConfig.Certificates = []Certificate{tt.cert}
++
++			clientErr, serverErr := handshakeWithRewrite(t, clientConfig, serverConfig, false, typeServerKeyExchange, func(msg []byte) {
++				if tt.scheme == 0 {
++					return
++				}
++				// ECParameters (curve_type, named_curve, public key), then
++				// the signature scheme.
++				i := 4 + int(msg[3])
++				msg[i], msg[i+1] = byte(tt.scheme>>8), byte(tt.scheme)
++			})
++			if tt.clientErr == "" {
++				if clientErr != nil || serverErr != nil {
++					t.Fatalf("handshake failed: client: %v, server: %v", clientErr, serverErr)
++				}
++				if hookRuns != 1 {
++					t.Errorf("hook ran %d times, want 1", hookRuns)
++				}
++				return
++			}
++			if clientErr == nil || !strings.Contains(clientErr.Error(), tt.clientErr) {
++				t.Errorf("client error = %v, want %q", clientErr, tt.clientErr)
++			}
++			if serverErr == nil || !strings.Contains(serverErr.Error(), "illegal parameter") {
++				t.Errorf("server error = %v, want an illegal_parameter alert", serverErr)
++			}
++			if hookRuns != 0 {
++				t.Errorf("hook ran %d times, want 0", hookRuns)
++			}
++		})
++	}
++}
++
++// TestVerifyUnsupportedSignatureCertificateVerifyScheme checks that the
++// signature scheme of a CertificateVerify by a client with an unsupported key
++// must be one the server advertised before the hook is called. Whether the
++// scheme fits the key is for the hook to check.
++func TestVerifyUnsupportedSignatureCertificateVerifyScheme(t *testing.T) {
++	cert, pool := unsupportedKeyCertificate(t, "client.example")
++	const notAdvertised SignatureScheme = 0xfe01 // private use (RFC 8446)
++	for _, tt := range []struct {
++		name        string
++		scheme      SignatureScheme // replaces the client's scheme; 0 keeps it
++		serverErr   string
++		wantHookRun bool
++	}{
++		{"ECDSA scheme", 0, "", true},
++		{"not advertised", notAdvertised, "invalid signature algorithm", false},
++		{"RSA scheme", PKCS1WithSHA256, "unsupported signature scheme", true},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			var hookRuns int
++			var gotScheme SignatureScheme
++			serverConfig := testConfigServer.Clone()
++			serverConfig.MaxVersion = VersionTLS12
++			serverConfig.ClientAuth = RequireAnyClientCert
++			serverConfig.ClientCAs = pool // sent as the acceptable CAs
++			serverConfig.VerifyUnsupportedSignature = func(leaf *x509.Certificate, scheme SignatureScheme, signed, sig []byte) error {
++				hookRuns++
++				gotScheme = scheme
++				return verifyUnsupportedCurveSignature(leaf, scheme, signed, sig)
++			}
++			clientConfig := testConfigClient.Clone()
++			clientConfig.Certificates = []Certificate{cert}
++
++			clientErr, serverErr := handshakeWithRewrite(t, clientConfig, serverConfig, true, typeCertificateVerify, func(msg []byte) {
++				if tt.scheme != 0 {
++					msg[0], msg[1] = byte(tt.scheme>>8), byte(tt.scheme)
++				}
++			})
++			if wantRuns := map[bool]int{true: 1, false: 0}[tt.wantHookRun]; hookRuns != wantRuns {
++				t.Errorf("hook ran %d times, want %d", hookRuns, wantRuns)
++			}
++			if tt.serverErr == "" {
++				if clientErr != nil || serverErr != nil {
++					t.Fatalf("handshake failed: client: %v, server: %v", clientErr, serverErr)
++				}
++				return
++			}
++			if serverErr == nil || !strings.Contains(serverErr.Error(), tt.serverErr) {
++				t.Errorf("server error = %v, want %q", serverErr, tt.serverErr)
++			}
++			wantAlert := "error decrypting message" // decrypt_error
++			if !tt.wantHookRun {
++				wantAlert = "illegal parameter"
++			} else if gotScheme != tt.scheme {
++				t.Errorf("hook got scheme %v, want %v", gotScheme, tt.scheme)
++			}
++			if clientErr == nil || !strings.Contains(clientErr.Error(), wantAlert) {
++				t.Errorf("client error = %v, want %q", clientErr, wantAlert)
++			}
++		})
++	}
++}

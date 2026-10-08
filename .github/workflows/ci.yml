@@ -1,0 +1,149 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: gofmt
+        run: |
+          mapfile -t files < <(git ls-files '*.go')
+          out=$(gofmt -l "${files[@]}")
+          if [ -n "$out" ]; then echo "not gofmt-ed:"; echo "$out"; exit 1; fi
+      - name: go vet (stock)
+        run: go vet ./...
+      - name: go vet (overlay, -tags=ivory)
+        run: |
+          ivory-overlay build -profile core
+          eval "$(ivory-overlay env -profile core)"
+          go vet ./...
+      - name: go vet and go test cmd/ivory-overlay (pinned Go)
+        run: |
+          go -C cmd/ivory-overlay vet ./...
+          go -C cmd/ivory-overlay test -count=1 -v ./...
+      - name: shellcheck
+        run: shellcheck -S warning scripts/ivory-overlay scripts/*.sh
+
+  # cmd/ivory-overlay is a module of its own so that an older Go can build it
+  # and bootstrap the pinned release; check the oldest Go it supports.
+  tool:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: false
+      - name: build, vet and test cmd/ivory-overlay with Go 1.22
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go version
+          go -C cmd/ivory-overlay vet ./...
+          go -C cmd/ivory-overlay test -count=1 ./...
+          go -C cmd/ivory-overlay build -o "$RUNNER_TEMP/ivory-overlay" .
+          "$RUNNER_TEMP/ivory-overlay" latest
+
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: go test (stock)
+        run: go test -count=1 -v ./...
+
+  overlay:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, kt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: build overlay
+        run: |
+          ivory-overlay build -profile ${{ matrix.profile }}
+          ivory-overlay doctor -profile ${{ matrix.profile }}
+      - name: go test -short crypto/x509 crypto/tls (overlay)
+        run: ivory-overlay stdtest -profile ${{ matrix.profile }}
+      - name: go vet crypto/x509 crypto/tls for windows and darwin (overlay)
+        run: |
+          eval "$(ivory-overlay env -profile ${{ matrix.profile }})"
+          cd "$GOROOT/src"
+          for os in windows darwin; do GOOS=$os go vet crypto/x509 crypto/tls; done
+      - name: go test (overlay, -tags=ivory)
+        run: |
+          eval "$(ivory-overlay env -profile ${{ matrix.profile }})"
+          go test -count=1 -v ./...
+      - name: BoGo Renegotiate-* (materialized GOROOT)
+        run: ivory-overlay bogo -profile ${{ matrix.profile }} -filter 'Renegotiate-*'
+
+  # TLS 1.3 with Brainpool groups and signature schemes (RFC 8734) against
+  # OpenSSL >= 3.2; the runner's OpenSSL 3.0.13 has them only in TLS 1.2.
+  tls13:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, kt]
+    env:
+      OPENSSL_VERSION: 3.5.4
+      OPENSSL_SHA256: 967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ivory/openssl-${{ env.OPENSSL_VERSION }}
+          key: openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: build OpenSSL from source
+        run: scripts/build-openssl.sh "$OPENSSL_VERSION" "$OPENSSL_SHA256" "$HOME/.cache/ivory/openssl-$OPENSSL_VERSION"
+      - name: build overlay
+        run: ivory-overlay build -profile ${{ matrix.profile }}
+      - name: TLS 1.3 tests (I13-I16, tlsutil)
+        run: |
+          eval "$(ivory-overlay env -profile ${{ matrix.profile }})"
+          export IVORY_OPENSSL3="$HOME/.cache/ivory/openssl-$OPENSSL_VERSION/bin/openssl" IVORY_REQUIRE_TLS13=1
+          "$IVORY_OPENSSL3" version
+          go test -count=1 -v -run 'TestI1[3-6]' ./interop
+          go test -count=1 -v ./tlsutil
+
+  # Interop with BouncyCastle's TLS provider for Java (BCJSSE), TLS 1.2 and
+  # TLS 1.3, both roles (interop/bc_test.go).
+  bc:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, kt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ivory/bouncycastle
+          key: bouncycastle-${{ hashFiles('scripts/fetch-bouncycastle.sh') }}
+      - name: fetch BouncyCastle
+        run: scripts/fetch-bouncycastle.sh "$HOME/.cache/ivory/bouncycastle"
+      - name: build overlay
+        run: ivory-overlay build -profile ${{ matrix.profile }}
+      - name: BouncyCastle interop (B1-B5)
+        run: |
+          eval "$(ivory-overlay env -profile ${{ matrix.profile }})"
+          java -version
+          export IVORY_BCJARS="$HOME/.cache/ivory/bouncycastle" IVORY_REQUIRE_BC=1
+          go test -count=1 -v -run 'TestB[1-9]' ./interop

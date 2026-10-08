@@ -1,0 +1,6 @@
+# Build outputs. The overlay and materialized GOROOTs live in $IVORY_CACHE
+# (default ~/.cache/ivory), never in the repository.
+/overlay.json
+/build/
+*.test
+*.out

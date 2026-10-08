@@ -1,0 +1,32 @@
+name: setup-ivory
+description: Build cmd/ivory-overlay, install the pinned Go release (overlay/GOVERSION) and put both on PATH.
+runs:
+  using: composite
+  steps:
+    - id: ver
+      shell: bash
+      run: echo "go=$(tr -d '[:space:]' < overlay/GOVERSION)" >> "$GITHUB_OUTPUT"
+    # Any Go >= 1.22 builds the tool, which downloads the pinned release from
+    # the module proxy.
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.x'
+        cache: false
+    - shell: bash
+      run: |
+        go -C cmd/ivory-overlay build -o "$RUNNER_TEMP/ivory-bin/ivory-overlay" .
+        echo "$RUNNER_TEMP/ivory-bin" >> "$GITHUB_PATH"
+    - uses: actions/cache@v4
+      with:
+        path: ~/.cache/ivory/${{ steps.ver.outputs.go }}
+        key: ivory-${{ steps.ver.outputs.go }}-${{ runner.os }}-${{ runner.arch }}
+    - shell: bash
+      run: |
+        "$RUNNER_TEMP/ivory-bin/ivory-overlay" toolchain
+        echo "$HOME/.cache/ivory/${{ steps.ver.outputs.go }}/bin" >> "$GITHUB_PATH"
+        echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+    - shell: bash
+      run: |
+        go version
+        openssl version
+        git --version

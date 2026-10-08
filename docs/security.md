@@ -1,0 +1,139 @@
+# ivory security notes
+
+What ivory guarantees, what it relies on, and what it leaves to the
+product that uses it. The [user guide](user-guide.md) shows how to use it;
+[compliance.md](compliance.md) maps TI requirements to code and tests.
+
+> **Status:** ivory has had a self-review, not an external one. Get an
+> external review of the Brainpool code and the patches before production
+> use.
+
+## 1. The patches
+
+The overlay patches `crypto/x509` and `crypto/tls` of a pinned Go release.
+They contain no cryptography of their own: they let code outside the
+standard library take part where Go rejects keys and groups it doesn't
+implement.
+
+- **Opt-in.** Without the new `tls.Config` fields, a patched `crypto/tls`
+  behaves like Go's. The one exception is P0: a TLS 1.2 server refuses
+  renegotiation with a `no_renegotiation` alert instead of
+  `unexpected_message`; it refused before too.
+- **Fail closed.** A peer key that `crypto/tls` doesn't support is
+  rejected unless `Config.VerifyUnsupportedSignature` is set, and its
+  error rejects the handshake. The usual checks still run first: the
+  signature scheme must be one that was advertised, and in TLS 1.2 it must
+  fit the cipher suite.
+- **Off in FIPS 140-3 mode.** With `GODEBUG=fips140=on`, the hooks
+  (`VerifyUnsupportedSignature`, `KeyExchanges`, signing with opaque key
+  types, unknown `SignatureSchemes`) are not used.
+- **Certificate verification doesn't change.** `crypto/x509` now parses
+  certificates with keys on curves it doesn't implement (P1), but
+  `Certificate.Verify` never returns a chain that contains one, on any
+  platform. `GODEBUG=x509unknowncurve=0` restores the old parse error.
+
+### Your code verifies Brainpool chains
+
+Because `crypto/x509` can't verify Brainpool signatures, TLS
+configurations with Brainpool peers set `InsecureSkipVerify` and check
+the peer in `VerifyConnection`:
+
+- `ti.Verifier` checks a certificate the way TI products do: issued
+  directly by one of the stored CA certificates (two levels, no path
+  building), validity, keyUsage, extended key usage, policies, optional
+  CRLs.
+- `tlsutil.ChainVerifier` checks a short chain against root certificates
+  (validity, CA flags, extended key usage, host name).
+
+The `ti` presets wire this up. **A configuration of your own with
+`InsecureSkipVerify` and no `VerifyConnection` check accepts any
+certificate.**
+
+## 2. Constant time
+
+| Code | Handles secrets | Constant time |
+|---|---|---|
+| `brainpool`: key generation, ECDH, ECDSA signing, KEM | private scalars, nonces, shared secrets | yes: Montgomery ladder over all scalar bits with complete addition formulas, conditional swaps by masks, `filippo.io/bigmod` without its VarTime functions, Fermat inversion; no `math/big`. Branches only in rejection loops with secret-independent outcome. |
+| `brainpool`: verification, public key parsing | no | uses the same code |
+| `x509util` | no (parses public keys and certificates; private key parsing hands the scalar to `brainpool`) | not needed |
+| `tlsutil` | passes keys to `brainpool` or a card | not needed |
+| the patches | no | not needed |
+
+Limits of that statement:
+
+- It is a source and assembly review plus a statistical timing test
+  (Welch's t-test on the scalar multiplication), done by the developers.
+- It assumes that 64-bit multiplication and addition with carry take
+  data-independent time (true for current x86-64 cores). Power and
+  electromagnetic side channels are not considered.
+- `filippo.io/bigmod` (the module form of Go's internal `bigmod`) is
+  trusted; only how ivory calls it was reviewed.
+
+## 3. Random numbers
+
+- **Source.** `brainpool` takes all randomness from `crypto/rand`. In the
+  pinned Go release, `crypto/rand.Reader` uses `getrandom(2)` on Linux, and
+  Go's key generation and signing functions ignore a caller's
+  `io.Reader` since Go 1.26 (unless `GODEBUG=cryptocustomrand=1`).
+  `brainpool` does the same: its `rand` parameters are ignored.
+- **Signatures** use RFC 6979 nonces hedged with fresh random bytes
+  (RFC 6979, Section 3.6): two signatures of the same message differ, and
+  a failing random source doesn't reveal the key.
+- **Certification.** BSI TR-03116-1 (V3.20, Sections 3.8 and 3.9) requires
+  a deterministic RNG of class DRG.3 (AIS 20) or a physical RNG of class
+  PTG.2 (AIS 31) for key generation, and at least DRG.2 or PTG.2 for
+  challenges and padding. Whether the Linux kernel's RNG on your platform
+  meets that is a property of the platform, not of ivory; the product
+  must provide the evidence. Long-term keys generated on a smart card
+  (gSMC-KT, SMC-B, HBA) don't depend on it. Use `tlsutil.RawSigner` to
+  sign with them.
+
+## 4. Erasure of secrets
+
+GS-A_5322 (gemSpec_Krypt V2.51.0) asks that TLS key material be "sicher
+gelöscht" after at most 24 hours. Go can't guarantee that:
+
+- The garbage collector frees memory without clearing it and may have
+  copied values before (stack growth, slices).
+- `crypto/tls` keeps session secrets in its own structures; no API wipes
+  them.
+- `runtime/secret` (`secret.Do`) erases registers, stack and, eventually,
+  heap allocations of a function call, but in the pinned release it exists
+  only with `GOEXPERIMENT=runtimesecret`, isn't covered by Go's
+  compatibility promise, and ivory doesn't use it.
+
+What ivory does: every handshake uses a fresh ephemeral key; the `ti`
+server presets disable session tickets; `ti.SessionTickets` rotates
+ticket keys (none older than 48 hours with daily rotation) and refuses
+sessions older than 24 hours; `ti.NewClientSessionCache` drops a session
+24 hours after the full handshake that created its secret. That bounds
+how long secrets are *used*, not how long they stay in memory. A product
+that must show erasure needs measures outside Go (process lifetime,
+memory protection) and an argument for its evaluator.
+
+## 5. Protocol choices
+
+- **TLS 1.2 only in the `ti` presets.** A Go TLS 1.3 client always offers
+  ChaCha20-Poly1305, which BSI TR-02102-2 doesn't allow, and gemSpec_Krypt
+  allows TLS 1.3 only with TR-02102-2 configurations. TLS 1.3 with
+  Brainpool works (user guide, Section 6), but not with a TI-compliant
+  cipher suite offer from a Go client.
+- **SHA-1** is not used in TLS 1.2 handshake signatures by default since
+  Go 1.25 (`GODEBUG=tlssha1=0`). Don't re-enable it; A_21275-01 forbids it.
+  `tlsutil.VerifyUnsupportedSignature` and `x509util` reject SHA-1 for
+  Brainpool keys in any case.
+- **Renegotiation** is refused (P0, GS-A_5524).
+- **Brainpool groups** come after Go's built-in groups. A peer that
+  supports both negotiates P-256 or P-384 in TLS 1.2 with the `ti`
+  presets; Brainpool is used when the peer offers only Brainpool.
+- **Session resumption** (`ti`): see Section 4.
+
+## 6. The toolchain
+
+- `ivory-overlay toolchain` downloads the pinned release from the Go
+  module proxy; the go command checks it against the Go checksum
+  database.
+- Every build checks the files the patches touch against SHA-256 pins in
+  `overlay/pins` before it applies them, and refuses a mismatch.
+- The overlay applies to the go command's view of the source; the
+  compiler and runtime are Go's.

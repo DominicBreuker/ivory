@@ -1,0 +1,113 @@
+crypto/tls: refuse client-initiated renegotiation with no_renegotiation
+
+A TLS 1.2 server that receives a ClientHello after the handshake now
+sends a fatal no_renegotiation alert (RFC 5246, Section 7.2.2) instead
+of a fatal unexpected_message. handleRenegotiation already had a
+no_renegotiation branch for servers, but the HelloRequest type check
+came first, so a ClientHello never reached it.
+
+The alert is fatal, as in BoringSSL, because the connection is closed
+anyway; BoGo expects "remote error: no renegotiation". A client that
+refuses a HelloRequest still sends it as a warning.
+
+Re-enable BoGo's Renegotiate-Server-Forbidden.
+
+ivory: P0, profile core. Requirement: GS-A_5524 (gemSpec_KT V3.17.1).
+Base: go1.27.2. Upstream: a bug fix; to be filed first.
+
+--- a/src/crypto/tls/bogo_config.json
++++ b/src/crypto/tls/bogo_config.json
+@@ -109,7 +109,6 @@
+         "Resume-Server-PSKBinderFirstExtension-SecondBinder": "TODO: first pass, this should be fixed",
+         "Resume-Server-NoPSKBinder-SecondBinder": "TODO: first pass, this should be fixed",
+         "Resume-Server-OmitPSKsOnSecondClientHello": "TODO: first pass, this should be fixed",
+-        "Renegotiate-Server-Forbidden": "TODO: first pass, this should be fixed",
+         "Renegotiate-Client-Forbidden-1": "TODO: first pass, this should be fixed",
+         "UnknownExtension-Client": "TODO: first pass, this should be fixed",
+         "UnknownUnencryptedExtension-Client-TLS13": "TODO: first pass, this should be fixed",
+--- a/src/crypto/tls/conn.go
++++ b/src/crypto/tls/conn.go
+@@ -843,8 +843,8 @@
+ 		return c.out.setErrorLocked(&net.OpError{Op: "local error", Err: err})
+ 	}
+ 
+-	switch err {
+-	case alertNoRenegotiation, alertCloseNotify:
++	switch {
++	case err == alertCloseNotify, err == alertNoRenegotiation && c.isClient:
+ 		c.tmp[0] = alertLevelWarning
+ 	default:
+ 		c.tmp[0] = alertLevelError
+@@ -1265,6 +1265,13 @@
+ 		return err
+ 	}
+ 
++	// A server refuses a client-initiated renegotiation with a
++	// no_renegotiation alert (RFC 5246, Section 7.2.2). The alert is fatal,
++	// as in BoringSSL, because the connection is closed anyway.
++	if _, ok := msg.(*clientHelloMsg); ok && !c.isClient {
++		return c.sendAlert(alertNoRenegotiation)
++	}
++
+ 	helloReq, ok := msg.(*helloRequestMsg)
+ 	if !ok {
+ 		c.sendAlert(alertUnexpectedMessage)
+--- a/src/crypto/tls/handshake_server_test.go
++++ b/src/crypto/tls/handshake_server_test.go
+@@ -396,6 +396,56 @@
+ 	}
+ }
+ 
++// TestServerRejectsRenegotiation checks that a server answers a ClientHello
++// sent after the handshake with a fatal no_renegotiation alert.
++func TestServerRejectsRenegotiation(t *testing.T) {
++	c, s := localPipe(t)
++	clientConfig := testConfigClient.Clone()
++	clientConfig.MaxVersion = VersionTLS12
++	cli := Client(c, clientConfig)
++	defer cli.Close()
++
++	serverErr := make(chan error, 1)
++	go func() {
++		srv := Server(s, testConfigServer.Clone())
++		defer srv.Close()
++		if err := srv.Handshake(); err != nil {
++			serverErr <- err
++			return
++		}
++		_, err := srv.Read(make([]byte, 1))
++		serverErr <- err
++	}()
++
++	if err := cli.Handshake(); err != nil {
++		t.Fatalf("handshake failed: %v", err)
++	}
++	// crypto/tls clients never renegotiate on their own, so send the
++	// ClientHello by hand.
++	clientHello := &clientHelloMsg{
++		vers:                         VersionTLS12,
++		random:                       make([]byte, 32),
++		cipherSuites:                 []uint16{TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
++		compressionMethods:           []uint8{compressionNone},
++		secureRenegotiationSupported: true,
++		secureRenegotiation:          cli.clientFinished[:],
++		supportedCurves:              []CurveID{CurveP256},
++		supportedPoints:              []uint8{pointFormatUncompressed},
++	}
++	if _, err := cli.writeHandshakeRecord(clientHello, nil); err != nil {
++		t.Fatalf("writing ClientHello: %v", err)
++	}
++
++	err := <-serverErr
++	if opErr, ok := errors.AsType[*net.OpError](err); !ok || opErr.Op != "local error" || opErr.Err != error(alertNoRenegotiation) {
++		t.Errorf("server error = %v; want local error: %v", err, error(alertNoRenegotiation))
++	}
++	_, err = cli.Read(make([]byte, 1))
++	if opErr, ok := errors.AsType[*net.OpError](err); !ok || opErr.Op != "remote error" || opErr.Err != error(alertNoRenegotiation) {
++		t.Errorf("client error = %v; want remote error: %v", err, error(alertNoRenegotiation))
++	}
++}
++
+ func TestAlertForwarding(t *testing.T) {
+ 	c, s := localPipe(t)
+ 	go func() {

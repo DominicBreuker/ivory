@@ -1,0 +1,349 @@
+crypto/tls: add Config.SignatureSchemes
+
+crypto/tls advertises a fixed list of signature algorithms in the
+signature_algorithms and signature_algorithms_cert extensions of the
+ClientHello and the CertificateRequest. A TLS 1.3 peer whose
+certificate key is on a Brainpool curve must sign with
+ecdsa_brainpoolP256r1tls13_sha256, ecdsa_brainpoolP384r1tls13_sha384 or
+ecdsa_brainpoolP512r1tls13_sha512 (RFC 8734), so it can only use a
+certificate, or be accepted, if the other side lists those algorithms.
+Products in the German health care network must also restrict the
+advertised algorithms (no Ed25519 or ML-DSA, BSI TR-02102-2).
+
+Add Config.SignatureSchemes, shaped like the field requested in
+golang/go#63527: the algorithms to advertise and accept, in preference
+order, instead of the default list. Algorithms that are disabled for
+the protocol versions offered, in FIPS 140-3 mode or by GODEBUG settings
+are left out of signature_algorithms, as for the default list; the
+signature_algorithms_cert list keeps the ones disabled only for
+handshake signatures. Algorithms this package doesn't implement are
+advertised only for TLS 1.3 and only if VerifyUnsupportedSignature is
+set: only peers whose keys this package doesn't support can use them,
+and the function verifies them. The field doesn't restrict the
+algorithms used for signing; Certificate.SupportedSignatureAlgorithms
+does that.
+
+The field is provisional: if golang/go#63527 adds such a list, this
+change reduces to allowing algorithms this package doesn't implement in
+it when VerifyUnsupportedSignature is set.
+
+ivory: P5, profiles core and kt. Base: go1.27.2 with P0-P4.
+Upstream: via golang/go#63527 (provisional). Requirement: A_18467
+(gemSpec_Krypt V2.51.0).
+Status: TLS 1.3; provisional API.
+
+diff --git a/src/crypto/tls/common.go b/src/crypto/tls/common.go
+--- a/src/crypto/tls/common.go
++++ b/src/crypto/tls/common.go
+@@ -858,6 +858,23 @@ type Config struct {
+ 	// versions.
+ 	KeyExchanges []KeyExchange
+ 
++	// SignatureSchemes, if not nil, lists the signature algorithms that are
++	// advertised in the signature_algorithms and signature_algorithms_cert
++	// extensions of ClientHello and CertificateRequest messages, in
++	// preference order, instead of a default list. The peer's handshake
++	// signatures must use one of them. It doesn't restrict the algorithms
++	// used to sign; see Certificate.SupportedSignatureAlgorithms.
++	//
++	// Algorithms that are disabled for the protocol versions offered (such
++	// as PKCS #1 v1.5 in TLS 1.3), in FIPS 140-3 mode, or by GODEBUG
++	// settings are left out of signature_algorithms. Algorithms that this
++	// package doesn't implement, such as ecdsa_brainpoolP256r1tls13_sha256
++	// (RFC 8734), are advertised only for TLS 1.3, and only if
++	// VerifyUnsupportedSignature is set, which verifies them.
++	//
++	// This field is provisional, pending golang/go#63527.
++	SignatureSchemes []SignatureScheme
++
+ 	// DynamicRecordSizingDisabled disables adaptive sizing of TLS records.
+ 	// When true, the largest possible TLS record size is always used. When
+ 	// false, the size of TLS records may be adjusted in an attempt to
+@@ -1079,6 +1096,7 @@ func (c *Config) Clone() *Config {
+ 		MaxVersion:                          c.MaxVersion,
+ 		CurvePreferences:                    c.CurvePreferences,
+ 		KeyExchanges:                        c.KeyExchanges,
++		SignatureSchemes:                    c.SignatureSchemes,
+ 		DynamicRecordSizingDisabled:         c.DynamicRecordSizingDisabled,
+ 		Renegotiation:                       c.Renegotiation,
+ 		KeyLogWriter:                        c.KeyLogWriter,
+@@ -1994,6 +2012,43 @@ func isDisabledSignatureAlgorithm(version uint16, s SignatureScheme, isCert bool
+ 	return false
+ }
+ 
++// supportedSignatureAlgorithms is like the function of the same name, but
++// returns c.SignatureSchemes if set.
++func (c *Config) supportedSignatureAlgorithms(minVers, maxVers uint16) []SignatureScheme {
++	if c == nil || c.SignatureSchemes == nil {
++		return supportedSignatureAlgorithms(minVers, maxVers)
++	}
++	return c.signatureSchemes(minVers, maxVers, false)
++}
++
++// supportedSignatureAlgorithmsCert is like the function of the same name,
++// but returns c.SignatureSchemes if set.
++func (c *Config) supportedSignatureAlgorithmsCert(minVers, maxVers uint16) []SignatureScheme {
++	if c == nil || c.SignatureSchemes == nil {
++		return supportedSignatureAlgorithmsCert(minVers, maxVers)
++	}
++	return c.signatureSchemes(minVers, maxVers, true)
++}
++
++// signatureSchemes returns the algorithms of c.SignatureSchemes that are
++// enabled at a version from minVers to maxVers. Algorithms that this package
++// doesn't implement are kept for TLS 1.3 if VerifyUnsupportedSignature can
++// be used, since only peers whose keys this package doesn't support can use
++// them.
++func (c *Config) signatureSchemes(minVers, maxVers uint16, isCert bool) []SignatureScheme {
++	return slices.DeleteFunc(slices.Clone(c.SignatureSchemes), func(s SignatureScheme) bool {
++		if _, _, err := typeAndHashFromSignatureScheme(s); err != nil {
++			return maxVers < VersionTLS13 || !c.supportsUnsupportedPeerKey(VersionTLS13)
++		}
++		for v := minVers; v <= maxVers; v++ {
++			if !isDisabledSignatureAlgorithm(v, s, isCert) {
++				return false
++			}
++		}
++		return true
++	})
++}
++
+ // supportedSignatureAlgorithmsCert returns the supported algorithms for
+ // signatures in certificates.
+ func supportedSignatureAlgorithmsCert(minVers, maxVers uint16) []SignatureScheme {
+diff --git a/src/crypto/tls/handshake_client.go b/src/crypto/tls/handshake_client.go
+--- a/src/crypto/tls/handshake_client.go
++++ b/src/crypto/tls/handshake_client.go
+@@ -124,8 +124,8 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
+ 	}
+ 
+ 	if maxVersion >= VersionTLS12 {
+-		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms(minVersion, maxVersion)
+-		hello.supportedSignatureAlgorithmsCert = supportedSignatureAlgorithmsCert(minVersion, maxVersion)
++		hello.supportedSignatureAlgorithms = config.supportedSignatureAlgorithms(minVersion, maxVersion)
++		hello.supportedSignatureAlgorithmsCert = config.supportedSignatureAlgorithmsCert(minVersion, maxVersion)
+ 	}
+ 
+ 	var keyShareKeys *keySharePrivateKeys
+diff --git a/src/crypto/tls/handshake_client_tls13.go b/src/crypto/tls/handshake_client_tls13.go
+--- a/src/crypto/tls/handshake_client_tls13.go
++++ b/src/crypto/tls/handshake_client_tls13.go
+@@ -654,7 +654,7 @@ func (hs *clientHandshakeStateTLS13) readServerCertificate() error {
+ 	// See RFC 8446, Section 4.4.3.
+ 	// We don't use hs.hello.supportedSignatureAlgorithms because it might
+ 	// include PKCS#1 v1.5 and SHA-1 if the ClientHello also supported TLS 1.2.
+-	if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms(c.vers, c.vers)) ||
++	if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, c.config.supportedSignatureAlgorithms(c.vers, c.vers)) ||
+ 		!isPeerSignatureSchemeTLS13(c.peerCertificates[0], certVerify.signatureAlgorithm) {
+ 		c.sendAlert(alertIllegalParameter)
+ 		return errors.New("tls: certificate used with invalid signature algorithm")
+diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_server.go
+--- a/src/crypto/tls/handshake_server.go
++++ b/src/crypto/tls/handshake_server.go
+@@ -669,7 +669,7 @@ func (hs *serverHandshakeState) doFullHandshake() error {
+ 		}
+ 		if c.vers >= VersionTLS12 {
+ 			certReq.hasSignatureAlgorithm = true
+-			certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms(c.vers, c.vers)
++			certReq.supportedSignatureAlgorithms = c.config.supportedSignatureAlgorithms(c.vers, c.vers)
+ 		}
+ 
+ 		// An empty list of certificateAuthorities signals to
+diff --git a/src/crypto/tls/handshake_server_tls13.go b/src/crypto/tls/handshake_server_tls13.go
+--- a/src/crypto/tls/handshake_server_tls13.go
++++ b/src/crypto/tls/handshake_server_tls13.go
+@@ -835,8 +835,8 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
+ 		certReq := new(certificateRequestMsgTLS13)
+ 		certReq.ocspStapling = true
+ 		certReq.scts = true
+-		certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms(c.vers, c.vers)
+-		certReq.supportedSignatureAlgorithmsCert = supportedSignatureAlgorithmsCert(c.vers, c.vers)
++		certReq.supportedSignatureAlgorithms = c.config.supportedSignatureAlgorithms(c.vers, c.vers)
++		certReq.supportedSignatureAlgorithmsCert = c.config.supportedSignatureAlgorithmsCert(c.vers, c.vers)
+ 		if c.config.ClientCAs != nil {
+ 			certReq.certificateAuthorities = c.config.ClientCAs.Subjects()
+ 		}
+@@ -1088,7 +1088,7 @@ func (hs *serverHandshakeStateTLS13) readClientCertificate() error {
+ 		// See RFC 8446, Section 4.4.3.
+ 		// We don't use certReq.supportedSignatureAlgorithms because it would
+ 		// require keeping the certificateRequestMsgTLS13 around in the hs.
+-		if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, supportedSignatureAlgorithms(c.vers, c.vers)) ||
++		if !isSupportedSignatureAlgorithm(certVerify.signatureAlgorithm, c.config.supportedSignatureAlgorithms(c.vers, c.vers)) ||
+ 			!isPeerSignatureSchemeTLS13(c.peerCertificates[0], certVerify.signatureAlgorithm) {
+ 			c.sendAlert(alertIllegalParameter)
+ 			return errors.New("tls: client certificate used with invalid signature algorithm")
+diff --git a/src/crypto/tls/signature_schemes_test.go b/src/crypto/tls/signature_schemes_test.go
+new file mode 100644
+--- /dev/null
++++ b/src/crypto/tls/signature_schemes_test.go
+@@ -0,0 +1,158 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package tls
++
++import (
++	"slices"
++	"strings"
++	"testing"
++)
++
++// recordSignatureSchemes makes config record the signature_algorithms of
++// the ClientHellos it receives.
++func recordSignatureSchemes(config *Config) *[]SignatureScheme {
++	var schemes []SignatureScheme
++	config.GetConfigForClient = func(chi *ClientHelloInfo) (*Config, error) {
++		schemes = slices.Clone(chi.SignatureSchemes)
++		return nil, nil
++	}
++	return &schemes
++}
++
++func TestSignatureSchemesAdvertised(t *testing.T) {
++	list := []SignatureScheme{ECDSAWithP256AndSHA256, testSchemeUnimplemented, PSSWithSHA256, PKCS1WithSHA1}
++	for _, tt := range []struct {
++		name       string
++		schemes    []SignatureScheme
++		hook       bool
++		maxVersion uint16
++		want       []SignatureScheme
++	}{
++		{"default", nil, false, 0, supportedSignatureAlgorithms(VersionTLS12, VersionTLS13)},
++		// SHA-1 is disabled in TLS 1.2 (tlssha1=0) and TLS 1.3.
++		{"no hook", list, false, 0, []SignatureScheme{ECDSAWithP256AndSHA256, PSSWithSHA256}},
++		{"hook", list, true, 0, []SignatureScheme{ECDSAWithP256AndSHA256, testSchemeUnimplemented, PSSWithSHA256}},
++		{"hook, TLS 1.2", list, true, VersionTLS12, []SignatureScheme{ECDSAWithP256AndSHA256, PSSWithSHA256}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			clientConfig := testConfigClient.Clone()
++			clientConfig.MaxVersion = tt.maxVersion
++			clientConfig.SignatureSchemes = tt.schemes
++			if tt.hook {
++				clientConfig.VerifyUnsupportedSignature = verifyTestScheme
++			}
++			serverConfig := testConfigServer.Clone()
++			got := recordSignatureSchemes(serverConfig)
++			if _, _, err := testHandshake(t, clientConfig, serverConfig); err != nil {
++				t.Fatal(err)
++			}
++			if !slices.Equal(*got, tt.want) {
++				t.Errorf("signature_algorithms = %v, want %v", *got, tt.want)
++			}
++		})
++	}
++
++	// signature_algorithms_cert keeps the algorithms that are only
++	// disabled for handshake signatures.
++	config := &Config{SignatureSchemes: list, VerifyUnsupportedSignature: verifyTestScheme}
++	if got := config.supportedSignatureAlgorithmsCert(VersionTLS12, VersionTLS13); !slices.Equal(got, list) {
++		t.Errorf("signature_algorithms_cert = %v, want %v", got, list)
++	}
++	if got, want := (*Config)(nil).supportedSignatureAlgorithmsCert(VersionTLS12, VersionTLS13), supportedSignatureAlgorithmsCert(VersionTLS12, VersionTLS13); !slices.Equal(got, want) {
++		t.Errorf("default signature_algorithms_cert = %v, want %v", got, want)
++	}
++}
++
++func TestSignatureSchemesAccepted(t *testing.T) {
++	t.Run("server certificate", func(t *testing.T) {
++		// The server has only an ECDSA certificate.
++		clientConfig := testConfigClient.Clone()
++		clientConfig.SignatureSchemes = []SignatureScheme{PSSWithSHA256}
++		serverConfig := testConfigServer.Clone()
++		serverConfig.Certificates = []Certificate{testECDSAP256Cert}
++		_, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++		if serverErr == nil || !strings.Contains(serverErr.Error(), "doesn't support any of the certificate's signature algorithms") {
++			t.Errorf("server error = %v, want no common signature algorithm", serverErr)
++		}
++	})
++
++	t.Run("client certificate", func(t *testing.T) {
++		// The client has only a P-256 certificate.
++		serverConfig := testConfigServer.Clone()
++		serverConfig.ClientAuth = RequireAnyClientCert
++		serverConfig.SignatureSchemes = []SignatureScheme{ECDSAWithP384AndSHA384}
++		clientConfig := testConfigClient.Clone()
++		clientConfig.Certificates = []Certificate{testClientECDSAP256Cert}
++		_, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++		if serverErr == nil || !strings.Contains(serverErr.Error(), "client didn't provide a certificate") {
++			t.Errorf("server error = %v, want no client certificate", serverErr)
++		}
++	})
++}
++
++// TestSignatureSchemesUnsupportedKey checks the TLS 1.3 handshake with a
++// peer whose key this package doesn't support, signing with an algorithm
++// this package doesn't implement, advertised through SignatureSchemes.
++func TestSignatureSchemesUnsupportedKey(t *testing.T) {
++	schemes := append(defaultSupportedSignatureAlgorithms(), testSchemeUnimplemented)
++	for _, tt := range []struct {
++		name      string
++		client    bool // whether the unsupported key is the client's
++		schemes   []SignatureScheme
++		hook      bool
++		wantError string
++	}{
++		{"server", false, schemes, true, ""},
++		{"client", true, schemes, true, ""},
++		{"server, not advertised", false, defaultSupportedSignatureAlgorithms(), true, "peer doesn't support any of the certificate's signature algorithms"},
++		{"server, no hook", false, schemes, false, "peer doesn't support any of the certificate's signature algorithms"},
++		// The CertificateRequest leaves out testSchemeUnimplemented, so the
++		// client has no certificate to send.
++		{"client, no hook", true, schemes, false, "client didn't provide a certificate"},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			cert, _, pool := unimplementedSchemeCertificate(t, "peer.example", ECDSAWithP256AndSHA256, testSchemeUnimplemented)
++			clientConfig := testConfigClient.Clone()
++			clientConfig.InsecureSkipVerify = true
++			serverConfig := testConfigServer.Clone()
++			verifier := clientConfig
++			if tt.client {
++				clientConfig.Certificates = []Certificate{cert}
++				serverConfig.ClientAuth = RequireAnyClientCert
++				serverConfig.ClientCAs = pool
++				verifier = serverConfig
++			} else {
++				serverConfig.Certificates = []Certificate{cert}
++			}
++			verifier.SignatureSchemes = tt.schemes
++			if tt.hook {
++				verifier.VerifyUnsupportedSignature = verifyTestScheme
++			}
++			clientErr, serverErr := fipsHandshake(t, clientConfig, serverConfig)
++			if tt.wantError == "" {
++				if clientErr != nil || serverErr != nil {
++					t.Fatalf("handshake failed: client: %v, server: %v", clientErr, serverErr)
++				}
++				return
++			}
++			if serverErr == nil || !strings.Contains(serverErr.Error(), tt.wantError) {
++				t.Errorf("server error = %v, want %q", serverErr, tt.wantError)
++			}
++		})
++	}
++}
++
++func TestSignatureSchemesFIPS(t *testing.T) {
++	runWithFIPSEnabled(t, func(t *testing.T) {
++		config := &Config{
++			SignatureSchemes:           []SignatureScheme{ECDSAWithP256AndSHA256, testSchemeUnimplemented, Ed25519},
++			VerifyUnsupportedSignature: verifyTestScheme,
++		}
++		got := config.supportedSignatureAlgorithms(VersionTLS12, VersionTLS13)
++		if slices.Contains(got, testSchemeUnimplemented) {
++			t.Errorf("signature_algorithms = %v in FIPS 140-3 mode, want no %v", got, testSchemeUnimplemented)
++		}
++	})
++}
+diff --git a/src/crypto/tls/tls_test.go b/src/crypto/tls/tls_test.go
+--- a/src/crypto/tls/tls_test.go
++++ b/src/crypto/tls/tls_test.go
+@@ -995,6 +995,8 @@ func TestCloneNonFuncFields(t *testing.T) {
+ 			f.Set(reflect.ValueOf([]CurveID{CurveP256}))
+ 		case "KeyExchanges":
+ 			f.Set(reflect.ValueOf([]KeyExchange{{ID: 0xFE01, MaxVersion: VersionTLS12}}))
++		case "SignatureSchemes":
++			f.Set(reflect.ValueOf([]SignatureScheme{ECDSAWithP256AndSHA256}))
+ 		case "Renegotiation":
+ 			f.Set(reflect.ValueOf(RenegotiateOnceAsClient))
+ 		case "EncryptedClientHelloConfigList":

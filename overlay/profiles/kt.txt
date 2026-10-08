@@ -1,0 +1,10 @@
+# Profile kt: core plus the eHealth-KT-only patches (P6, P7), in order.
+# One patch file name per line; "#" starts a comment.
+0000-crypto-tls-no-renegotiation.patch
+0100-crypto-x509-unknown-named-curves.patch
+0200-crypto-tls-unsupported-peer-keys.patch
+0300-crypto-tls-opaque-signer-keys.patch
+0400-crypto-tls-external-key-exchanges.patch
+0500-crypto-tls-signature-schemes.patch
+0900-crypto-tls-kt-certificate-types.patch
+0910-crypto-tls-ecdsa-first-order.patch

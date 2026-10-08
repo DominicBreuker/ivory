@@ -1,0 +1,15 @@
+# Literal rewrites that "ivory-overlay tipcheck" applies after the patches,
+# to the files they write, so that they build on Go's development branch:
+# changes there that the pinned release doesn't have yet. One "old => new"
+# per line. The upstream versions of the patches need the same changes.
+
+# crypto/tls tests: testConfigClient and testConfigServer are functions on
+# the development branch (variables in go1.27).
+testConfigClient.Clone() => testConfigClient()
+testConfigServer.Clone() => testConfigServer()
+
+# crypto/tls: the development branch rejects a certificate that FIPS 140-3
+# mode doesn't allow before the key type check, so P2's FIPS test sees
+# "server's certificate is not allowed in FIPS 140-3 mode" instead of the
+# unsupported key error. Both fail the handshake before the hook runs.
+fipsHandshake(t, clientConfig, serverConfig)\n\t\tif clientErr == nil || !strings.Contains(clientErr.Error(), "unsupported type of public key") { => fipsHandshake(t, clientConfig, serverConfig)\n\t\tif clientErr == nil || !strings.Contains(clientErr.Error(), "not allowed in FIPS 140-3 mode") {

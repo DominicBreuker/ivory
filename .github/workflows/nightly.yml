@@ -1,0 +1,48 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bogo:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, kt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: full BoGo (materialized GOROOT)
+        run: ivory-overlay bogo -profile ${{ matrix.profile }}
+
+  x509-long:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: go test crypto/x509, non-short (x509-limbo, PKITS)
+        run: |
+          ivory-overlay build -profile core
+          eval "$(ivory-overlay env -profile core)"
+          cd "$GOROOT/src"
+          go test -count=1 crypto/x509
+
+  # Applies the upstream patches P0-P5 to Go's development branch, adapts
+  # them with overlay/tip-rewrites.txt, builds it and runs the crypto/x509
+  # and crypto/tls tests there. A failure means the development branch
+  # changed in a way the patches or the rewrites don't follow yet.
+  tipcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-ivory
+      - name: tipcheck (golang/go master)
+        run: ivory-overlay tipcheck -profile core
+      - name: tipcheck -test (build tip, go test crypto/x509 crypto/tls)
+        run: ivory-overlay tipcheck -profile core -test
