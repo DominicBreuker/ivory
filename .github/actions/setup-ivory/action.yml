@@ -8,7 +8,7 @@ runs:
       run: echo "go=$(tr -d '[:space:]' < overlay/GOVERSION)" >> "$GITHUB_OUTPUT"
     # Any Go >= 1.22 builds the tool, which downloads the pinned release from
     # the module proxy.
-    - uses: actions/setup-go@v5
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.24.x'
         cache: false
@@ -16,7 +16,7 @@ runs:
       run: |
         go -C cmd/ivory-overlay build -o "$RUNNER_TEMP/ivory-bin/ivory-overlay" .
         echo "$RUNNER_TEMP/ivory-bin" >> "$GITHUB_PATH"
-    - uses: actions/cache@v4
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cache/ivory/${{ steps.ver.outputs.go }}
         key: ivory-${{ steps.ver.outputs.go }}-${{ runner.os }}-${{ runner.arch }}

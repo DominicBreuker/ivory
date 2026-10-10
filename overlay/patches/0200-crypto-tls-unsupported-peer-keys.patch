@@ -287,7 +287,7 @@ diff --git a/src/crypto/tls/unsupported_key_test.go b/src/crypto/tls/unsupported
 new file mode 100644
 --- /dev/null
 +++ b/src/crypto/tls/unsupported_key_test.go
-@@ -0,0 +1,582 @@
+@@ -0,0 +1,586 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -519,6 +519,7 @@ new file mode 100644
 +}
 +
 +func TestVerifyUnsupportedSignatureServerCertificate(t *testing.T) {
++	skipFIPS(t) // Hooks are off in FIPS 140-3 mode; see TestVerifyUnsupportedSignatureFIPS.
 +	cert, pool := unsupportedKeyCertificate(t, "server.example")
 +	for _, tt := range unsupportedKeyTests() {
 +		t.Run(tt.name, func(t *testing.T) {
@@ -590,6 +591,7 @@ new file mode 100644
 +}
 +
 +func TestVerifyUnsupportedSignatureClientCertificate(t *testing.T) {
++	skipFIPS(t) // Hooks are off in FIPS 140-3 mode; see TestVerifyUnsupportedSignatureFIPS.
 +	cert, pool := unsupportedKeyCertificate(t, "client.example")
 +	for _, tt := range unsupportedKeyTests() {
 +		t.Run(tt.name, func(t *testing.T) {
@@ -749,6 +751,7 @@ new file mode 100644
 +// is checked before the hook is called: it must be one the client advertised,
 +// and its signature algorithm must match the cipher suite.
 +func TestVerifyUnsupportedSignatureServerKeyExchangeScheme(t *testing.T) {
++	skipFIPS(t) // Hooks are off in FIPS 140-3 mode; see TestVerifyUnsupportedSignatureFIPS.
 +	cert, _ := unsupportedKeyCertificate(t, "server.example")
 +	rsaCert := Certificate{Certificate: cert.Certificate, PrivateKey: testRSA2048Cert.PrivateKey}
 +	const notAdvertised SignatureScheme = 0xfe01 // private use (RFC 8446)
@@ -814,6 +817,7 @@ new file mode 100644
 +// must be one the server advertised before the hook is called. Whether the
 +// scheme fits the key is for the hook to check.
 +func TestVerifyUnsupportedSignatureCertificateVerifyScheme(t *testing.T) {
++	skipFIPS(t) // Hooks are off in FIPS 140-3 mode; see TestVerifyUnsupportedSignatureFIPS.
 +	cert, pool := unsupportedKeyCertificate(t, "client.example")
 +	const notAdvertised SignatureScheme = 0xfe01 // private use (RFC 8446)
 +	for _, tt := range []struct {

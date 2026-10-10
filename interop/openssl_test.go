@@ -118,14 +118,20 @@ func (p *peerProc) output() string {
 // waitFor waits until the output contains s or the process exits, and
 // reports whether the output contains s.
 func (p *peerProc) waitFor(s string) bool {
+	return p.waitForN(s, 1)
+}
+
+// waitForN waits until the output contains s n times or the process
+// exits, and reports whether it does.
+func (p *peerProc) waitForN(s string, n int) bool {
 	deadline := time.Now().Add(opTimeout)
 	for time.Now().Before(deadline) {
-		if strings.Contains(p.output(), s) {
+		if strings.Count(p.output(), s) >= n {
 			return true
 		}
 		select {
 		case <-p.done:
-			return strings.Contains(p.output(), s)
+			return strings.Count(p.output(), s) >= n
 		case <-time.After(10 * time.Millisecond):
 		}
 	}

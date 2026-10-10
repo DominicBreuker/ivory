@@ -176,7 +176,7 @@ diff --git a/src/crypto/tls/signature_schemes_test.go b/src/crypto/tls/signature
 new file mode 100644
 --- /dev/null
 +++ b/src/crypto/tls/signature_schemes_test.go
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,160 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -201,6 +201,7 @@ new file mode 100644
 +}
 +
 +func TestSignatureSchemesAdvertised(t *testing.T) {
++	skipFIPS(t) // Unsupported schemes are dropped in FIPS 140-3 mode; see TestSignatureSchemesFIPS.
 +	list := []SignatureScheme{ECDSAWithP256AndSHA256, testSchemeUnimplemented, PSSWithSHA256, PKCS1WithSHA1}
 +	for _, tt := range []struct {
 +		name       string
@@ -275,6 +276,7 @@ new file mode 100644
 +// peer whose key this package doesn't support, signing with an algorithm
 +// this package doesn't implement, advertised through SignatureSchemes.
 +func TestSignatureSchemesUnsupportedKey(t *testing.T) {
++	skipFIPS(t) // Unsupported schemes are dropped in FIPS 140-3 mode; see TestSignatureSchemesFIPS.
 +	schemes := append(defaultSupportedSignatureAlgorithms(), testSchemeUnimplemented)
 +	for _, tt := range []struct {
 +		name      string

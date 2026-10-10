@@ -298,7 +298,7 @@ diff --git a/src/crypto/tls/opaque_key_test.go b/src/crypto/tls/opaque_key_test.
 new file mode 100644
 --- /dev/null
 +++ b/src/crypto/tls/opaque_key_test.go
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,573 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -410,6 +410,7 @@ new file mode 100644
 +}
 +
 +func TestOpaqueKeyServer(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	for _, tt := range []struct {
 +		name       string
 +		schemes    []SignatureScheme
@@ -451,6 +452,7 @@ new file mode 100644
 +}
 +
 +func TestOpaqueKeyClient(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	cert, signer, pool := opaqueKeyCertificate(t, "client.example", ECDSAWithP256AndSHA256)
 +	serverConfig := testConfigServer.Clone()
 +	serverConfig.MaxVersion = VersionTLS12
@@ -477,6 +479,7 @@ new file mode 100644
 +// certificate and a certificate with an opaque ECDSA key picks the one that
 +// fits the cipher suites the client offers.
 +func TestOpaqueKeyCertificateSelection(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	// The certificates are valid for the client's server name.
 +	opaqueCert, _, pool := opaqueKeyCertificate(t, "test.golang.example", ECDSAWithP256AndSHA256)
 +	for _, tt := range []struct {
@@ -522,6 +525,7 @@ new file mode 100644
 +}
 +
 +func TestOpaqueKeySupportsCertificate(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	opaqueCert, _, pool := opaqueKeyCertificate(t, "example.golang", ECDSAWithP256AndSHA256)
 +	otherCert, _, _ := opaqueKeyCertificate(t, "other.example", ECDSAWithP256AndSHA256)
 +	noSchemes := opaqueCert
@@ -656,6 +660,7 @@ new file mode 100644
 +}
 +
 +func TestOpaqueKeyErrors(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	opaqueCert, _, _ := opaqueKeyCertificate(t, "example.golang", ECDSAWithP256AndSHA256)
 +	for _, tt := range []struct {
 +		name       string
@@ -771,6 +776,7 @@ new file mode 100644
 +// unhashed content and SignatureSchemeOptions, and that the peer passes the
 +// same content to Config.VerifyUnsupportedSignature.
 +func TestOpaqueKeyTLS13(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	for _, tt := range []struct {
 +		name    string
 +		client  bool // whether the opaque key is the client's
@@ -836,6 +842,7 @@ new file mode 100644
 +}
 +
 +func TestOpaqueKeyTLS13Errors(t *testing.T) {
++	skipFIPS(t) // Opaque keys are rejected in FIPS 140-3 mode; see TestOpaqueKeyFIPS.
 +	for _, tt := range []struct {
 +		name      string
 +		schemes   []SignatureScheme

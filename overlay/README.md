@@ -321,7 +321,11 @@ hunks; rebase that one by hand (below). It commits nothing.
    and `stdtest` for every profile, and `bogo` for TLS changes.
 5. A patch that adds a `tls.Config` field also updates
    `TestCloneNonFuncFields` or `TestCloneFuncFields`.
-6. A patch that changes what crypto/tls writes may break recorded
+6. Hooks are off in FIPS 140-3 mode, and Go's builders run the crypto
+   tests in that mode too: a test that needs a hook starts with
+   `skipFIPS(t)`, and one test per patch checks the FIPS behavior. Run
+   `GOFIPS140=latest scripts/ivory-overlay stdtest` as well (CI does).
+7. A patch that changes what crypto/tls writes may break recorded
    handshake tests (`testdata/Client-*`, `Server-*`). Re-record them with
    `go test crypto/tls -run <Test> -args -update`, with OpenSSL 1.1.1 first
    on PATH (`handshake_test.go` refuses other versions), and keep the

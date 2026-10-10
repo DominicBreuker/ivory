@@ -85,7 +85,7 @@ diff --git a/src/crypto/tls/ecdsa_first_test.go b/src/crypto/tls/ecdsa_first_tes
 new file mode 100644
 --- /dev/null
 +++ b/src/crypto/tls/ecdsa_first_test.go
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,72 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -102,6 +102,7 @@ new file mode 100644
 +// gemSpec_Krypt A_17124-03 and A_17094-02 require, whatever the order of
 +// Config.CipherSuites.
 +func TestECDSASuitesFirst(t *testing.T) {
++	skipFIPS(t) // No CBC or ChaCha20-Poly1305 suites in FIPS 140-3 mode.
 +	for _, tt := range []struct {
 +		name   string
 +		suites []uint16

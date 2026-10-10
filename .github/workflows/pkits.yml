@@ -1,0 +1,66 @@
+name: pkits
+
+# Runs gematik's PKI test suite (github.com/gematik/app-PkiTestsuite,
+# v8.1.0) against examples/fachdienst with scripts/run-pkits.sh. On
+# demand only: Actions → pkits → Run workflow. All tests take about 80
+# minutes. The suite's report and the logs are uploaded as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: 'Product type of the test data'
+        required: true
+        default: 'KimFachdienst'
+        type: choice
+        options:
+          - KimFachdienst
+          - KimFachdienstNist
+      tests:
+        description: 'Comma-separated test classes or tests (for example OcspApprovalTests,TslSignerApprovalTests#verifyTslSignerCertExpired); empty: all tests of allTests.txt'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  pkits:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ivory
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: pkits-m2-${{ hashFiles('scripts/run-pkits.sh') }}
+      - name: run the PKI test suite
+        env:
+          PKITS_TYPE: ${{ inputs.type }}
+          TESTS: ${{ inputs.tests }}
+        run: scripts/run-pkits.sh "$RUNNER_TEMP/pkits" "$TESTS"
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '### PKI test suite against examples/fachdienst'
+            echo '```'
+            grep -A6 'Tests Execution Summary' "$RUNNER_TEMP/pkits/run.log" | tail -6 || echo 'no summary (see the logs)'
+            grep -h '<--- Test Results' "$RUNNER_TEMP/pkits/run.log" | grep -v SUCCESSFUL | sed 's/.*---> *//' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the report and logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pkits-${{ inputs.type }}
+          path: |
+            ${{ runner.temp }}/pkits/*.log
+            ${{ runner.temp }}/pkits/pkits/out/testreport/
+            ${{ runner.temp }}/pkits/pkits/out/logs/
+          if-no-files-found: warn

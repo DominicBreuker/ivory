@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/DominicBreuker/ivory/x509util"
@@ -35,6 +36,13 @@ func mustOID(s string) x509.OID {
 // gemSpec_PKI TUC_PKI_018). CA certificates sent by the peer are never
 // used. Signatures are checked with package x509util, so keys may be
 // Brainpool keys.
+//
+// The issuing CA is the stored CA certificate whose subject is the
+// certificate's issuer and, if both certificates carry key identifiers,
+// whose subject key identifier is the certificate's authority key
+// identifier. A certificate with a critical extension that crypto/x509
+// doesn't process is rejected (gemSpec_PKI GS-A_4661-01, RFC 5280
+// Section 4.2).
 type Verifier struct {
 	// CAs are the trusted issuing CA certificates. They must be CAs whose
 	// keyUsage, if present, allows keyCertSign.
@@ -57,6 +65,14 @@ type Verifier struct {
 
 	// RequireCRL makes certificates fail whose CA has no entry in CRLs.
 	RequireCRL bool
+
+	// Status, if not nil, is called last with the certificate and the
+	// stored CA certificate that issued it, after all other checks
+	// passed; an error rejects the certificate. Package tsl provides one
+	// (TSL.Status) that checks the CA's status in the TSL, whether the CA
+	// may issue the certificate's type, and the certificate's OCSP status
+	// (gemSpec_PKI TUC_PKI_018 steps 5 and 7, TUC_PKI_007).
+	Status func(cert, ca *x509.Certificate) error
 
 	// Time returns the current time. If nil, time.Now is used.
 	Time func() time.Time
@@ -89,10 +105,18 @@ func (v *Verifier) Verify(leaf *x509.Certificate, dnsName string) error {
 	if leaf.BasicConstraintsValid && leaf.IsCA {
 		return fmt.Errorf("ti: certificate %q is a CA certificate", leaf.Subject)
 	}
+	if len(leaf.UnhandledCriticalExtensions) > 0 {
+		return fmt.Errorf("ti: certificate %q has an unhandled critical extension %v", leaf.Subject, leaf.UnhandledCriticalExtensions[0])
+	}
 	var ca *x509.Certificate
 	var caErr error
+	keyIDMismatch := false
 	for _, c := range v.CAs {
 		if !bytes.Equal(leaf.RawIssuer, c.RawSubject) {
+			continue
+		}
+		if len(leaf.AuthorityKeyId) > 0 && len(c.SubjectKeyId) > 0 && !bytes.Equal(leaf.AuthorityKeyId, c.SubjectKeyId) {
+			keyIDMismatch = true
 			continue
 		}
 		if err := x509util.CheckCertificateSignatureFrom(leaf, c); err != nil {
@@ -103,16 +127,25 @@ func (v *Verifier) Verify(leaf *x509.Certificate, dnsName string) error {
 		break
 	}
 	if ca == nil {
-		if caErr != nil {
+		switch {
+		case caErr != nil:
 			return fmt.Errorf("ti: certificate %q: bad signature by its CA: %w", leaf.Subject, caErr)
+		case keyIDMismatch:
+			return fmt.Errorf("ti: certificate %q: no trusted CA %q has its authority key identifier %x", leaf.Subject, leaf.Issuer, leaf.AuthorityKeyId)
 		}
 		return fmt.Errorf("ti: certificate %q is not issued by a trusted CA", leaf.Subject)
 	}
 	if err := checkValidity(ca, now); err != nil {
 		return err
 	}
-	if v.KeyUsage != 0 && leaf.KeyUsage&v.KeyUsage != v.KeyUsage {
-		return fmt.Errorf("ti: certificate %q lacks key usage %#x", leaf.Subject, v.KeyUsage)
+	if missing := v.KeyUsage &^ leaf.KeyUsage; missing != 0 {
+		var names []string
+		for bit := x509.KeyUsage(1); bit <= missing; bit <<= 1 {
+			if missing&bit != 0 {
+				names = append(names, bit.String())
+			}
+		}
+		return fmt.Errorf("ti: certificate %q lacks key usage %s", leaf.Subject, strings.Join(names, ", "))
 	}
 	for _, eku := range v.ExtKeyUsages {
 		if !slices.Contains(leaf.ExtKeyUsage, eku) {
@@ -129,7 +162,15 @@ func (v *Verifier) Verify(leaf *x509.Certificate, dnsName string) error {
 			return err
 		}
 	}
-	return v.checkRevocation(leaf, ca, now)
+	if err := v.checkRevocation(leaf, ca, now); err != nil {
+		return err
+	}
+	if v.Status != nil {
+		if err := v.Status(leaf, ca); err != nil {
+			return fmt.Errorf("ti: certificate %q: %w", leaf.Subject, err)
+		}
+	}
+	return nil
 }
 
 func (v *Verifier) checkRevocation(leaf, ca *x509.Certificate, now time.Time) error {

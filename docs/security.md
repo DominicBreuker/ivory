@@ -40,10 +40,12 @@ the peer in `VerifyConnection`:
 
 - `ti.Verifier` checks a certificate the way TI products do: issued
   directly by one of the stored CA certificates (two levels, no path
-  building), validity, keyUsage, extended key usage, policies, optional
-  CRLs.
+  building; the CA is found by name, authority key identifier and
+  signature), validity, keyUsage, extended key usage, policies, no
+  unknown critical extensions, optional CRLs.
 - `tlsutil.ChainVerifier` checks a short chain against root certificates
-  (validity, CA flags, extended key usage, host name).
+  (validity, CA flags, path length constraints, no unknown critical
+  extensions, extended key usage, host name).
 
 The `ti` presets wire this up. **A configuration of your own with
 `InsecureSkipVerify` and no `VerifyConnection` check accepts any
@@ -127,6 +129,17 @@ memory protection) and an argument for its evaluator.
   supports both negotiates P-256 or P-384 in TLS 1.2 with the `ti`
   presets; Brainpool is used when the peer offers only Brainpool.
 - **Session resumption** (`ti`): see Section 4.
+- **`tlsutil.TLS12Fallback`** (opt-in) lets a server for TLS 1.2 and
+  1.3 answer in TLS 1.2 a client whose TLS 1.3 can't use the server's
+  Brainpool identity (Windows SChannel, OpenSSL before 3.2). It decides
+  from the ClientHello alone and only where TLS 1.3 would fail anyway,
+  so an RFC 8734 client keeps TLS 1.3. The connection then is TLS 1.2
+  with the config's TLS 1.2 settings; no TLS 1.3 downgrade sentinel is
+  sent, since the server offers TLS 1.2 only for that connection. An
+  active attacker who edits a client's ClientHello to trigger it breaks
+  the TLS 1.2 Finished check and gets a failed handshake, not a
+  downgrade. ivory never signs or verifies TLS 1.3 handshakes with
+  Brainpool keys under other schemes than 0x081A–0x081C.
 
 ## 6. The toolchain
 
@@ -137,3 +150,47 @@ memory protection) and an argument for its evaluator.
   `overlay/pins` before it applies them, and refuses a mismatch.
 - The overlay applies to the go command's view of the source; the
   compiler and runtime are Go's.
+
+## 7. TSL and OCSP
+
+Packages `tsl` and `ocsp` decide which certificates a product trusts, so
+their checks are security checks. What they do, and what they leave to
+the product:
+
+- **XML parsing.** The TSL parser is Go's `encoding/xml` tokenizer with a
+  tree of its own: DTDs (and with them entity expansion) are rejected, as
+  are encodings other than UTF-8, undeclared namespace prefixes,
+  duplicate attributes, duplicate `Id` values and nesting deeper than 64
+  levels. Attribute values with tabs or line breaks are rejected because
+  the parser doesn't normalize them as XML 1.0 requires, which would make
+  canonicalization differ from the signer's.
+- **XML signature.** Exactly one `ds:Signature` child of the root; exactly
+  one reference to the whole document (`URI=""`, enveloped-signature and
+  exclusive canonicalization); other references only to elements inside
+  that signature (the XAdES signed properties). Every digest must match.
+  The data the TSL returns comes from the same parsed tree that was
+  canonicalized, never from a second parser, so a signature-wrapping
+  document can't show the signature check one content and the caller
+  another. Comments are not signed (exclusive canonicalization without
+  comments) and are skipped when text is read. The canonicalization
+  is checked against libxml2 on real TSLs and fuzzed
+  (`FuzzCanonicalize`).
+- **Trust anchor and signer.** `TSL.Verify` trusts only the anchors it
+  is given; the signer certificate must be issued by one of them, valid,
+  with nonRepudiation and id-tsl-kp-tslSigning. Storing the anchor
+  securely, and importing a new one only through `tsl.Updater` (or after
+  your own checks), is the product's job.
+- **OCSP.** `ocsp.Response.Verify` trusts only the responder
+  certificates it is given (from the TSL); certificates in the response
+  are ignored. A response whose responder ID matches none of them fails
+  with `OCSP_CERT_MISSING`. Times are checked against the local clock
+  with the tolerances of GS-A_5215: the clock must be right.
+- **Availability.** A product that can't reach the TSL or an OCSP
+  responder rejects certificates (fail closed) unless it sets
+  `TolerateOCSPFailure`, and loses its trust space when the TSL's
+  NextUpdate and grace period have passed (`tsl.Updater.Current` returns
+  nil). Plan monitoring for both.
+- **Not covered:** the XML schema check is a structural check written
+  from the schema of ETSI TS 102 231, not a general XML Schema
+  validator; QES checks (BNetzA-VL, TUC_PKI_030) and CRL-based checks of
+  the TSL are not implemented.

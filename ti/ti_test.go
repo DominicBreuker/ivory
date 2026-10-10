@@ -8,6 +8,9 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"errors"
 	"math/big"
 	"net"
 	"strings"
@@ -72,6 +75,9 @@ func TestVerifier(t *testing.T) {
 	underP256 := issue(t, eeTemplate("konnektor.example", x509.ExtKeyUsageClientAuth, PolicySAKAUT), key, p.p256CA, p.p256CAKey)
 	p256Leaf := issue(t, eeTemplate("konnektor.example", x509.ExtKeyUsageClientAuth, PolicySAKAUT), newP256(t), p.bpCA, p.bpCAKey)
 	byEvil := issue(t, eeTemplate("konnektor.example", x509.ExtKeyUsageClientAuth, PolicySAKAUT), key, p.evilCA, p.evilCAKey)
+	noAKI := issue(t, eeTemplate("konnektor.example", x509.ExtKeyUsageClientAuth, PolicySAKAUT), key, &x509.Certificate{RawSubject: p.bpCA.RawSubject}, p.bpCAKey)
+	// Signed by the evil CA, but naming the trusted CA's key identifier.
+	forged := issue(t, eeTemplate("konnektor.example", x509.ExtKeyUsageClientAuth, PolicySAKAUT), key, p.bpCA, p.evilCAKey)
 
 	base := func() *Verifier {
 		v := KonnektorVerifier([]*x509.Certificate{p.bpCA, p.p256CA})
@@ -98,13 +104,26 @@ func TestVerifier(t *testing.T) {
 		{"P-256 leaf, Brainpool CA", base(), p256Leaf, "", ""},
 		{"host name", base(), good, "konnektor.example", ""},
 		{"wrong host name", base(), good, "other.example", "not other.example"},
-		{"evil CA with the same name", base(), byEvil, "", "bad signature"},
+		{"evil CA with the same name", base(), byEvil, "", "authority key identifier"},
+		{"evil CA with the same name and key identifier", base(), forged, "", "bad signature"},
+		{"no authority key identifier", base(), noAKI, "", ""},
+		{"unknown critical extension", base(), leaf(func(c *x509.Certificate) {
+			c.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 3}, Critical: true, Value: []byte{0x30, 0x00}}}
+		}), "", "unhandled critical extension"},
+		{"unknown non-critical extension", base(), leaf(func(c *x509.Certificate) {
+			c.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 3}, Value: []byte{0x30, 0x00}}}
+		}), "", ""},
 		{"unknown CA", KonnektorVerifier([]*x509.Certificate{p.p256CA}), good, "", "not issued by a trusted CA"},
 		{"intermediate not trusted", KonnektorVerifier([]*x509.Certificate{p.p256CA}), p.crlSigner, "", "not issued by a trusted CA"},
 		{"wrong policy", base(), leaf(func(c *x509.Certificate) { c.Policies = []x509.OID{PolicySMKTAUT} }), "", "none of the policies"},
 		{"no policy", base(), leaf(func(c *x509.Certificate) { c.Policies = nil }), "", "none of the policies"},
 		{"wrong extended key usage", base(), leaf(func(c *x509.Certificate) { c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }), "", "extended key usage"},
-		{"wrong key usage", base(), leaf(func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageKeyEncipherment }), "", "key usage"},
+		{"wrong key usage", base(), leaf(func(c *x509.Certificate) { c.KeyUsage = x509.KeyUsageKeyEncipherment }), "", "lacks key usage digitalSignature"},
+		{"key usages missing", func() *Verifier {
+			v := base()
+			v.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyAgreement | x509.KeyUsageKeyEncipherment
+			return v
+		}(), good, "", "lacks key usage keyEncipherment, keyAgreement"},
 		{"CA as leaf", base(), leaf(func(c *x509.Certificate) { c.IsCA = true }), "", "CA certificate"},
 		{"expired", base(), leaf(func(c *x509.Certificate) { c.NotBefore, c.NotAfter = testStart, testStart.Add(time.Hour) }), "", "not valid at"},
 		{"not yet valid", base(), leaf(func(c *x509.Certificate) { c.NotBefore, c.NotAfter = testNow.Add(time.Hour), testEnd }), "", "not valid at"},
@@ -118,6 +137,26 @@ func TestVerifier(t *testing.T) {
 		{"CRL from the wrong issuer", withCRLs(CRL{List: makeCRL(t, p.crlSigner, p.signerKey, testNow.Add(-time.Hour), testNow.Add(time.Hour)), CA: p.bpCA}), good, "", "not issued by its signer"},
 		{"CRL expired", withCRLs(CRL{List: makeCRL(t, p.bpCA, p.bpCAKey, testNow.Add(-2*time.Hour), testNow.Add(-time.Hour)), CA: p.bpCA}), good, "", "not current"},
 		{"CRL required, none", func() *Verifier { v := base(); v.RequireCRL = true; return v }(), good, "", "no CRL"},
+		{"status good", func() *Verifier {
+			v := base()
+			v.Status = func(cert, ca *x509.Certificate) error {
+				if !cert.Equal(good) || !ca.Equal(p.bpCA) {
+					return errors.New("wrong certificates")
+				}
+				return nil
+			}
+			return v
+		}(), good, "", ""},
+		{"status bad", func() *Verifier {
+			v := base()
+			v.Status = func(cert, ca *x509.Certificate) error { return errors.New("CERT_REVOKED") }
+			return v
+		}(), good, "", "CERT_REVOKED"},
+		{"status not called on earlier failure", func() *Verifier {
+			v := base()
+			v.Status = func(cert, ca *x509.Certificate) error { panic("called") }
+			return v
+		}(), byEvil, "", "authority key identifier"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.v.Time == nil {

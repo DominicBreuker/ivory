@@ -19,8 +19,10 @@ import (
 //
 // It checks that each certificate is signed by the next one in the chain,
 // until one is signed by a root; that all of them, the root included, are
-// valid at the current time; that the issuers are CAs; and that the leaf
-// allows KeyUsage. It does no path building and checks no name
+// valid at the current time; that the issuers are CAs and their path
+// length constraints hold; that no certificate of the chain has a critical
+// extension crypto/x509 doesn't process (RFC 5280, Section 4.2); and that
+// the leaf allows KeyUsage. It does no path building and checks no name
 // constraints, policies or revocation.
 type ChainVerifier struct {
 	// Roots are the trusted CA certificates.
@@ -69,11 +71,23 @@ func (v *ChainVerifier) Verify(chain []*x509.Certificate, dnsName string) error 
 		if err := checkValidity(c, now); err != nil {
 			return err
 		}
-		for _, root := range v.Roots {
-			if bytes.Equal(c.Raw, root.Raw) {
-				return nil
+		if slices.ContainsFunc(v.Roots, func(root *x509.Certificate) bool { return bytes.Equal(c.Raw, root.Raw) }) {
+			return nil
+		}
+		if len(c.UnhandledCriticalExtensions) > 0 {
+			return fmt.Errorf("tlsutil: certificate %q has an unhandled critical extension %v", c.Subject, c.UnhandledCriticalExtensions[0])
+		}
+		if i > 0 {
+			// c is an intermediate with i-1 intermediates below it.
+			if err := checkPathLen(c, i-1); err != nil {
+				return err
 			}
+		}
+		for _, root := range v.Roots {
 			if bytes.Equal(c.RawIssuer, root.RawSubject) && x509util.CheckCertificateSignatureFrom(c, root) == nil {
+				if err := checkPathLen(root, i); err != nil {
+					return err
+				}
 				return checkValidity(root, now)
 			}
 		}
@@ -89,6 +103,15 @@ func (v *ChainVerifier) Verify(chain []*x509.Certificate, dnsName string) error 
 		}
 	}
 	return fmt.Errorf("tlsutil: certificate %q is not signed by a trusted root", chain[len(chain)-1].Subject)
+}
+
+// checkPathLen checks ca's path length constraint for a path with n
+// intermediate certificates below ca.
+func checkPathLen(ca *x509.Certificate, n int) error {
+	if ca.BasicConstraintsValid && ca.MaxPathLen >= 0 && n > ca.MaxPathLen {
+		return fmt.Errorf("tlsutil: certificate %q allows a path length of %d, the chain has %d intermediates below it", ca.Subject, ca.MaxPathLen, n)
+	}
+	return nil
 }
 
 func checkValidity(c *x509.Certificate, now time.Time) error {

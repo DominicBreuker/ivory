@@ -19,10 +19,11 @@ and tests.
 4. [Use ivory from your module](#4-use-ivory-from-your-module)
 5. [TLS 1.2 for the TI](#5-tls-12-for-the-ti)
 6. [TLS 1.3 with Brainpool](#6-tls-13-with-brainpool)
-7. [Editors](#7-editors)
-8. [CI](#8-ci)
-9. [New Go releases](#9-new-go-releases)
-10. [Troubleshooting](#10-troubleshooting)
+7. [TSL and OCSP](#7-tsl-and-ocsp)
+8. [Editors](#8-editors)
+9. [CI](#9-ci)
+10. [New Go releases](#10-new-go-releases)
+11. [Troubleshooting](#11-troubleshooting)
 
 ## 1. What you need
 
@@ -191,6 +192,17 @@ func configs(ca *x509.Certificate) (server, client *tls.Config, err error) {
   (Konnektor towards a terminal), `ti.AddBrainpoolP512r1` (where
   brainpoolP512r1 is allowed). See the package documentation and
   `examples/ktserver`, `examples/connectorclient`.
+- CA certificates for a card terminal: the terminal stores the CAs of the
+  TSL whose service extension lists `oid_sak_aut` (1.2.276.0.76.4.113)
+  and passes them to `ti.KonnektorVerifier`. In the production
+  TSL(ECC-RSA) of September 2026 (sequence 10334) these are the six
+  component CAs GEM.KOMP-CA5 to GEM.KOMP-CA10, with RSA 2048,
+  brainpoolP256r1 and NIST P-256 keys, so Konnektor certificates can
+  come with any of the three key types. `ti.Verifier` checks all three.
+- Servers that check certificates against the TSL with OCSP, as
+  gematik's PKI test suite expects in approvals: see
+  [Section 7](#7-tsl-and-ocsp) and
+  [compliance.md](compliance.md#approval-tests-with-gematiks-pki-test-suite).
 - Session resumption: server presets disable session tickets.
   `ti.SessionTickets` enables them with key rotation and a 24 h limit,
   `ti.NewClientSessionCache` is a client cache with the same limit
@@ -248,8 +260,160 @@ What each setting does:
   Java supports them in TLS 1.2 and TLS 1.3 (tested with 1.86; the group
   names there are `brainpoolP256r1tls13` and so on, set with the system
   property `jdk.tls.namedGroups`).
+- Windows (SChannel, and so .NET's `SslStream`, tested on Windows Server
+  2025) has the Brainpool groups off by default; with them enabled (the
+  ECC curve order in group policy, or `Enable-TlsEccCurve` where no
+  policy overrides it) it speaks Brainpool with ivory in TLS 1.2, both
+  roles. Its TLS 1.3 isn't RFC 8734: it offers the TLS 1.2 code points
+  26–28 and none of the schemes 0x081A–0x081C, so no TLS 1.3 handshake
+  with Brainpool works. Use TLS 1.2 with Windows peers, or, on a server
+  that offers TLS 1.2 and 1.3, the opt-in `tlsutil.TLS12Fallback`:
 
-## 7. Editors
+  ```go
+  config.MinVersion, config.MaxVersion = tls.VersionTLS12, tls.VersionTLS13
+  config.GetConfigForClient = tlsutil.TLS12Fallback(config, certs)
+  ```
+
+  It answers in TLS 1.2 only a client that asks for TLS 1.3 but offers
+  Brainpool only with the TLS 1.2 code points and can use none of
+  `certs` in TLS 1.3, but one of them in TLS 1.2 (Windows SChannel,
+  OpenSSL before 3.2). Every other client, RFC 8734 clients in
+  particular, gets the same answer as without it. The fallback sends no
+  TLS 1.3 downgrade sentinel; an attacker can't trigger it for other
+  clients, because changing their ClientHello breaks the TLS 1.2
+  Finished check. As a client, set `MaxVersion` to TLS 1.2 towards a
+  Windows server with a Brainpool identity: such a server picks TLS 1.3
+  when offered and then fails, without falling back. ivory doesn't retry
+  with TLS 1.2 after a failed handshake: an attacker could provoke that
+  retry.
+
+## 7. TSL and OCSP
+
+TI products that check certificates take the trusted CAs from the TSL
+(trust-service status list) and ask the CA's OCSP responder about each
+certificate (gemSpec_PKI, TUC_PKI_001, TUC_PKI_006, TUC_PKI_018). The
+TSL of the ECC trust space is signed with brainpoolP256r1, and most OCSP
+responders of the TI sign with brainpoolP256r1, so standard Go packages
+can't verify either. Packages `tsl` and `ocsp` can:
+
+- `tsl.Parse` reads a TSL and checks it against the ETSI TS 102 231
+  schema; `TSL.Verify` checks the TSL signer certificate against the
+  trust anchor (the TSL signer CA certificate you store) and the XML
+  signature. `CAs`, `OCSPResponders`, `IssuerService` and
+  `AnnouncedTrustAnchor` give what the trust space consists of.
+- `tsl.Updater` keeps the trust space current: initial import, then
+  hash file, download from the primary and backup addresses, signature,
+  sequence number, the signer's OCSP status, trust anchor changes and
+  expiry.
+- `ocsp.Checker` asks a responder and verifies the answer as TUC_PKI_006
+  requires: signer from the TSL, signature (Brainpool, NIST or RSA),
+  CertID, the 37.5 second tolerances of GS-A_5215, certHash, status;
+  good answers are reused for a grace period. `ocsp.CreateRequest`,
+  `ParseResponse` and `Response.Verify` work on their own, and
+  `CreateResponse` builds responses with any `crypto.Signer`, for test
+  responders.
+- `TSL.Status` returns the TSL part of TUC_PKI_018 (the CA's status in
+  the TSL, whether the CA may issue the certificate's type, OCSP) as a
+  function for `ti.Verifier.Status`.
+
+A server that checks client certificates against the current trust
+space builds a `ti.Verifier` per handshake:
+
+```go
+//go:build ivory
+
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"time"
+
+	"github.com/DominicBreuker/ivory/ocsp"
+	"github.com/DominicBreuker/ivory/ti"
+	"github.com/DominicBreuker/ivory/tsl"
+)
+
+func serverConfig(cert tls.Certificate, firstTSL []byte, anchor *x509.Certificate, policies []x509.OID) (*tls.Config, error) {
+	updater := &tsl.Updater{OCSP: &ocsp.Checker{}}
+	if err := updater.Init(firstTSL, anchor); err != nil {
+		return nil, err
+	}
+	go func() {
+		for range time.Tick(24 * time.Hour) {
+			updater.Update(context.Background()) // log the error
+		}
+	}()
+	checker := &ocsp.Checker{GracePeriod: 10 * time.Minute}
+
+	config := ti.ServerConfig([]tls.Certificate{cert}, &ti.Verifier{})
+	config.VerifyConnection = func(cs tls.ConnectionState) error {
+		current := updater.Current()
+		if current == nil {
+			return errors.New("no valid TSL")
+		}
+		v := &ti.Verifier{
+			CAs:          current.CAs(),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			ExtKeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			Policies:     policies,
+			Status:       current.Status(tsl.StatusOptions{Policies: policies, OCSP: checker}),
+		}
+		return v.Verify(cs.PeerCertificates[0], "")
+	}
+	return config, nil
+}
+```
+
+`examples/fachdienst` is a complete server along these lines, with
+flags for the intervals, tolerances and the offline mode. It passes
+gematik's PKI test suite as product type KIM Fachdienst (111 of 111
+tests)
+([compliance.md](compliance.md#approval-tests-with-gematiks-pki-test-suite)).
+
+- The trust anchor of the production TSL(ECC-RSA) is the TSL signer CA
+  GEM.TSL-CA3 (brainpoolP256r1, valid until 2028-05-25). The TSL service
+  publishes it with its fingerprint at
+  `https://download.tsl.ti-dienste.de/ECC/` (`GEM.TSL-CA3.der`,
+  `GEM.TSL-CA3.der.sha2`): SHA-256
+  `e2992dc292f6aa8d9e462a7723f54c162853b4056c277260b82ce58921408448`.
+  gemSpec_PKI (GS-A_4640) requires you to validate the fingerprint before
+  you store the certificate as anchor; the TSL service also sends it by
+  letter on request. `scripts/fetch-production-tsl.sh` downloads the
+  current TSL and the anchor and checks both; `tsl.TestProductionTSL`
+  verifies them.
+- The reference and test environments' TSLs
+  (`https://download-ref.tsl.ti-dienste.de/ECC/`,
+  `https://download-test.tsl.ti-dienste.de/ECC/`) are signed under the
+  anchor GEM.TSL-CA28 TEST-ONLY (brainpoolP256r1, valid until
+  2028-04-06), which only the test host publishes
+  (`C.GEM.TSL-CA28_TEST-ONLY.der`, SHA-256
+  `43853a0e92bfd6e9e99f02c1d165a688aa94f0df74d8ea0ddf849ecd01be1d6a`).
+  `scripts/fetch-production-tsl.sh <dir> ref` (or `test`) fetches them.
+- `tsl` is tested against every production, reference and test TSL
+  archived since 2025-04 (136 files, `scripts/fetch-tsl-corpus.sh` and
+  `tsl.TestTSLCorpus`): each verifies against its anchor at its issue
+  date, and each environment's TSLs follow each other through the
+  `Updater`. A TSL that was reformatted after signing, as the test TSL
+  shipped with ZETA Guard (`ECC_TU_TSL_10691.xml`, indented), fails with
+  `tsl.ErrSignature`: store and pass TSLs byte for byte.
+- Errors wrap sentinel values named after gemSpec_PKI's error codes
+  (`ocsp.ErrRevoked` is `CERT_REVOKED`, `tsl.ErrSignature` is
+  `XML_SIGNATURE_ERROR`, …); test them with `errors.Is` and log them.
+- Certificates of the eGK are checked without certHash
+  (`ocsp.Checker.SkipCertHash`, TUC_PKI_018 step 7); everything else with
+  it.
+- The TSL parser rejects DTDs, non-UTF-8 documents and attribute values
+  with tabs or line breaks, and the signature must be the enveloped,
+  exclusively canonicalized form the TSL service writes. That is all the
+  TI's TSLs need; see [security.md](security.md) for what the XML
+  signature check guards against.
+- Without the overlay, the packages compile but skip Brainpool
+  certificates as unparsable: build with it.
+
+## 8. Editors
 
 Use a **materialized GOROOT** for editors. gopls doesn't apply a
 `GOFLAGS` overlay: it reads the source files itself, so it sees the
@@ -285,7 +449,7 @@ Other editors: set GOROOT and the build tags the same way, or start the
 editor from a shell after `eval "$(scripts/ivory-overlay env -profile
 core -materialized)"`.
 
-## 8. CI
+## 9. CI
 
 The same commands work in CI; ivory's own CI runs them. A GitHub Actions
 job for your module (replace `vX.Y.Z` by the ivory version in your
@@ -321,7 +485,7 @@ jobs:
 - Cache `~/.cache/ivory/<version>` (the toolchain, about 250 MB) with
   `actions/cache`, keyed by the version in `overlay/GOVERSION`.
 
-## 9. New Go releases
+## 10. New Go releases
 
 ivory pins one Go release; README.md lists it. When Go publishes a patch
 release, ivory adopts it with one command, run in a clean checkout of
@@ -341,7 +505,7 @@ whose context changed fails with the rejected hunks; it needs a rebase
 by hand. Going from go1.27.1 to go1.27.2 took 3 minutes 16 seconds,
 download included.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
@@ -355,6 +519,8 @@ download included.
 | TLS 1.3 peer sends no Brainpool certificate | `SignatureSchemes` lacks 0x081A–0x081C, or `VerifyUnsupportedSignature` is not set (Section 6) |
 | OpenSSL: "wrong curve" in TLS 1.2 | OpenSSL refuses an ECDSA certificate on a curve the peer didn't list in `supported_groups`; offer the Brainpool groups (`KeyExchanges`, or OpenSSL's `-groups`) |
 | `tlsutil: certificate … doesn't allow extended key usage anyExtendedKeyUsage` | set `ChainVerifier.KeyUsage` (for example `x509.ExtKeyUsageServerAuth`) |
+| `… has an unhandled critical extension 1.3.6.1.5.5.7.1.3` (or another OID) | the peer's certificate marks an extension critical that `crypto/x509` doesn't process; RFC 5280 and gemSpec_PKI GS-A_4661-01 require rejecting it. The certificate is wrong, not the configuration. |
+| `ti: certificate …: no trusted CA … has its authority key identifier …` | a CA of that name is trusted, but not the CA key that issued the certificate (for example a new CA generation); add that CA certificate to `Verifier.CAs` |
 
 `scripts/ivory-overlay doctor -profile <p>` prints the versions, the pin
 check and the builds, and runs a program that parses a Brainpool

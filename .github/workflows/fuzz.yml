@@ -1,6 +1,6 @@
 name: fuzz
 
-# Runs every fuzz target of the library, in parallel, for the given time.
+# Runs fuzz targets of the library, in parallel, for the given time.
 # On demand only: Actions → fuzz → Run workflow. A failing target uploads
 # its failing input (testdata/fuzz/…) as an artifact; add that file to the
 # repository to keep it as a regression test.
@@ -12,39 +12,76 @@ on:
         description: 'Time per target (go test -fuzztime), for example 1h or 30m'
         required: true
         default: '1h'
+      targets:
+        description: 'Targets to run, comma-separated (for example tlsutil:FuzzVerifyUnsupportedSignature,ti:FuzzVerifierCRL), or all'
+        required: true
+        default: 'all'
 
 permissions:
   contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.select.outputs.targets }}
+    steps:
+      - id: select
+        env:
+          WANT: ${{ inputs.targets }}
+        run: |
+          all='brainpool:FuzzScalarMult
+          brainpool:FuzzNewPublicKey
+          brainpool:FuzzVerifyASN1
+          x509util:FuzzParsePKIXPublicKey
+          x509util:FuzzParsePrivateKey
+          tlsutil:FuzzVerifyUnsupportedSignature
+          ti:FuzzVerifierCRL
+          ocsp:FuzzParseResponse
+          tsl:FuzzParse
+          internal/xmldsig:FuzzCanonicalize'
+          all=$(printf '%s\n' "$all" | sed 's/^ *//')
+          if [ "$WANT" = all ]; then
+            selected=$all
+          else
+            selected=$(printf '%s\n' "$WANT" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$')
+            for t in $selected; do
+              if ! printf '%s\n' "$all" | grep -qxF "$t"; then
+                echo "unknown target $t; known: $(echo $all)" >&2
+                exit 1
+              fi
+            done
+          fi
+          echo "targets=$(printf '%s\n' "$selected" | jq -Rnc '[inputs]')" >> "$GITHUB_OUTPUT"
+
   fuzz:
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - brainpool:FuzzScalarMult
-          - brainpool:FuzzNewPublicKey
-          - brainpool:FuzzVerifyASN1
-          - x509util:FuzzParsePKIXPublicKey
-          - x509util:FuzzParsePrivateKey
+        target: ${{ fromJSON(needs.plan.outputs.targets) }}
     name: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-ivory
       - name: fuzz
         env:
           TARGET: ${{ matrix.target }}
           FUZZTIME: ${{ inputs.fuzztime }}
         run: |
+          # tlsutil and ti need the overlay; the other packages don't
+          # mind it.
+          ivory-overlay build -profile core
+          eval "$(ivory-overlay env -profile core)"
           # Short minimization: one execution of the curve fuzzers takes
           # tens of milliseconds, and Go's default (up to 60 s per new
           # input) stalls them.
           go test -run '^$' -fuzz "^${TARGET#*:}\$" -fuzztime "$FUZZTIME" -fuzzminimizetime 10x "./${TARGET%%:*}"
       - name: upload the failing input
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-${{ strategy.job-index }}
           path: '*/testdata/fuzz/'

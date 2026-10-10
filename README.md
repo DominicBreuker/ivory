@@ -11,13 +11,18 @@ specified by gematik) requires. It keeps Go's own `crypto/tls` and
 - Brainpool keys in software or on a smart card (any `crypto.Signer`).
 - `tls.Config` presets for TI roles, including the eHealth card terminal
   (KT) and Konnektor-like clients.
+- The TSL and OCSP as gematik's PKI checks need them: TSL signatures
+  (brainpoolP256r1, XMLDSig), the trust space update, and OCSP responses
+  signed by Brainpool responders; an example server passes gematik's
+  PKI test suite (all 111 tests of its KIM Fachdienst profile).
 - Tested against OpenSSL 3.0 and 3.5, BouncyCastle's TLS provider for
-  Java and Go itself, with Go's own `crypto/tls` and `crypto/x509` test
-  suites, BoringSSL's BoGo, x509-limbo, Wycheproof and fuzzing.
+  Java, Windows SChannel (TLS 1.2) and Go itself, with Go's own
+  `crypto/tls` and `crypto/x509` test suites, BoringSSL's BoGo,
+  tlsfuzzer, x509-limbo, Wycheproof, the RFC and Botan Brainpool test
+  vectors, and fuzzing.
 
-> **Status: v0.1, first public release.** ivory has had a careful
-> self-review, not an external security review, and hasn't been tested
-> against real TI products yet. APIs may change before v1.0. Please read
+> **Status: v0.2.** ivory has had a careful self-review, not an external
+> security review, and hasn't been tested against real TI products yet. APIs may change before v1.0. Please read
 > [docs/security.md](docs/security.md) before you rely on it, and
 > [tell us](#feedback) how it works with your peers.
 
@@ -39,6 +44,8 @@ ivory has two parts:
 | [`x509util`](x509util) | Brainpool keys in PKIX, PKCS #8 and SEC 1; certificate, CSR and CRL signatures by Brainpool keys | no (Brainpool *certificates* parse only with the overlay) |
 | [`tlsutil`](tlsutil) | `crypto/tls` hooks: Brainpool groups, signature verification, signers (software keys and smart cards), certificate selection | yes |
 | [`ti`](ti) | `tls.Config` presets and certificate checks for TI roles | yes |
+| [`tsl`](tsl) | the TI's TSL: schema, XML signature, signer, trust space update, CA status for certificate checks | no (Brainpool certificates in the TSL parse only with the overlay) |
+| [`ocsp`](ocsp) | OCSP requests and responses with Brainpool, NIST and RSA responders; the checks of gemSpec_PKI | no (likewise) |
 
 The overlay comes in two profiles:
 
@@ -69,7 +76,7 @@ sets `GOFLAGS="-overlay=… -tags=ivory,ivory_core"` and
 mkdir ~/tlsdemo && cd ~/tlsdemo
 eval "$(~/ivory/scripts/ivory-overlay env -profile core)"
 go mod init example.com/tlsdemo
-go get github.com/DominicBreuker/ivory@v0.1.0   # the version of your ivory checkout
+go get github.com/DominicBreuker/ivory@v0.2.0   # the version of your ivory checkout
 # A Brainpool test identity and its CA from ivory's test PKI:
 cp ~/ivory/testdata/pki/bp256-server.pem server.pem
 cp ~/ivory/testdata/pki/bp256-server.key server.key
@@ -217,18 +224,30 @@ CI ([.github/workflows](.github/workflows)) runs on every push:
   both profiles, including the tests each patch adds; `go vet` of both
   packages for windows and darwin too;
 - ivory's tests with and without the overlay: Wycheproof ECDSA and ECDH
-  vectors for all three curves, test vectors from gemSpec_Krypt,
+  vectors for all three curves, the ECDH test vectors of RFC 7027 (and
+  RFC 8734) and RFC 6932, Botan's point multiplication and RFC 6979
+  vectors, test vectors from gemSpec_Krypt,
   differential tests against an independent implementation, OpenSSL and
   Python `cryptography`;
 - the interop matrix against OpenSSL 3.0 (TLS 1.2), OpenSSL 3.5 (TLS
   1.3), BouncyCastle's JSSE provider 1.86 (TLS 1.2 and 1.3), and Go ↔ Go
   ([interop/README.md](interop/README.md));
+- tlsfuzzer's Brainpool scripts and its ECDSA scripts with Brainpool
+  identities against ivory servers (F1–F6 in
+  [interop/README.md](interop/README.md));
+- Windows SChannel through .NET's `SslStream` on Windows Server 2025,
+  both roles (S1–S7: TLS 1.2 works; SChannel's TLS 1.3 isn't RFC 8734;
+  `tlsutil.TLS12Fallback` for servers that also offer TLS 1.3);
+- `tsl` against 136 archived production, reference and test TSLs;
 - wire probes of what crypto/tls sends ([probe/README.md](probe/README.md));
 - BoGo's renegotiation tests.
 
 Nightly: the full BoGo suite for both profiles, non-short `crypto/x509`
 (x509-limbo, NIST PKITS), and the patches on Go's development branch. On
-demand: every fuzz target (1 hour each by default).
+demand: every fuzz target (1 hour each by default), and gematik's PKI
+test suite against `examples/fachdienst` (`pkits.yml`, about 80
+minutes); every night also today's production, reference and test TSLs
+against their trust anchors (`scripts/fetch-production-tsl.sh`).
 [docs/brainpool-constant-time.md](docs/brainpool-constant-time.md) is the
 constant-time review of the Brainpool code.
 
@@ -236,9 +255,10 @@ constant-time review of the Brainpool code.
 
 - [docs/user-guide.md](docs/user-guide.md): the overlay or a materialized
   GOROOT, your own module, TLS 1.2 for the TI, TLS 1.3 with Brainpool,
-  editors, CI, new Go releases, troubleshooting.
+  TSL and OCSP, editors, CI, new Go releases, troubleshooting.
 - [docs/security.md](docs/security.md): what the patches change, what is
-  constant time, random numbers, erasure of secrets, protocol choices.
+  constant time, random numbers, erasure of secrets, protocol choices,
+  the TSL and OCSP checks.
 - [docs/compliance.md](docs/compliance.md): TI requirements, the
   mechanism that meets each, and its tests.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version.
@@ -256,11 +276,12 @@ explains how changes are made.
 
 | Path | Contents |
 |---|---|
-| `brainpool/`, `x509util/`, `tlsutil/`, `ti/` | the library |
+| `brainpool/`, `x509util/`, `tlsutil/`, `ti/`, `tsl/`, `ocsp/` | the library |
+| `internal/` | XML canonicalization and signatures for `tsl`; test helpers |
 | `overlay/` | patches, profiles, pinned file hashes, and the patch documentation |
 | `cmd/ivory-overlay/` | the overlay tool: fetch the toolchain, check pins, build the overlay or a patched GOROOT, test, adopt new Go releases (a module of its own, so that any Go ≥ 1.22 builds it) |
-| `scripts/` | `ivory-overlay` (builds and runs the tool), `gen-testpki.sh` (the test PKI), `build-openssl.sh` (OpenSSL from source for the TLS 1.3 tests), `fetch-bouncycastle.sh` (the BouncyCastle jars for the Java interop tests) |
-| `examples/` | a card terminal server and a Konnektor-like client |
+| `scripts/` | `ivory-overlay` (builds and runs the tool), `gen-testpki.sh` (the test PKI), `build-openssl.sh` (OpenSSL from source for the TLS 1.3 tests), `fetch-bouncycastle.sh` (the BouncyCastle jars for the Java interop tests), `fetch-gemlibpki.sh` (certificates and TSLs of the TI test PKI for the `ti` and `tsl` tests), `run-pkits.sh` (gematik's PKI test suite against `examples/fachdienst`), `fetch-production-tsl.sh` (today's production, reference or test TSL and its trust anchor), `fetch-tsl-corpus.sh` (archived TSLs for the `tsl` tests), `fetch-tlsfuzzer.sh` (tlsfuzzer for the interop tests F1–F6) |
+| `examples/` | a card terminal server, a Konnektor-like client, and a TI server that checks clients against the TSL with OCSP |
 | `interop/`, `probe/` | interop tests and wire probes |
 | `testdata/pki/` | test certificates and keys (Brainpool, P-256, RSA); test only |
 | `docs/` | user documentation |

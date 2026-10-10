@@ -4,3 +4,7 @@
 /build/
 *.test
 *.out
+
+# .NET build outputs of the SChannel peer
+interop/testdata/schannel/SChannelPeer/bin/
+interop/testdata/schannel/SChannelPeer/obj/

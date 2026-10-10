@@ -16,7 +16,7 @@ jobs:
       matrix:
         profile: [core, kt]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-ivory
       - name: full BoGo (materialized GOROOT)
         run: ivory-overlay bogo -profile ${{ matrix.profile }}
@@ -24,7 +24,7 @@ jobs:
   x509-long:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-ivory
       - name: go test crypto/x509, non-short (x509-limbo, PKITS)
         run: |
@@ -40,9 +40,31 @@ jobs:
   tipcheck:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup-ivory
       - name: tipcheck (golang/go master)
         run: ivory-overlay tipcheck -profile core
       - name: tipcheck -test (build tip, go test crypto/x509 crypto/tls)
         run: ivory-overlay tipcheck -profile core -test
+
+  # Verifies today's TSL of the TI's production, reference and test
+  # environments against its pinned trust anchor (GEM.TSL-CA3 and
+  # GEM.TSL-CA28 TEST-ONLY, brainpoolP256r1). A failure means the TSL
+  # service changed something: a new anchor (update the pin in
+  # scripts/fetch-production-tsl.sh after checking its fingerprint), a
+  # format ivory doesn't read, or an outage.
+  production-tsl:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [prod, ref, test]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-ivory
+      - name: verify the ${{ matrix.env }} TSL
+        run: |
+          scripts/fetch-production-tsl.sh "$RUNNER_TEMP/production-tsl" ${{ matrix.env }}
+          ivory-overlay build -profile core
+          eval "$(ivory-overlay env -profile core)"
+          IVORY_PRODUCTION_TSL="$RUNNER_TEMP/production-tsl" IVORY_REQUIRE_PRODUCTION_TSL=1 go test -count=1 -v -run TestProductionTSL ./tsl

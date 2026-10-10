@@ -3,7 +3,7 @@
 package interop
 
 // Interop with BouncyCastle's TLS provider for Java (BCJSSE), which many
-// TI products use (README.md): B1-B5. The BouncyCastle peer is
+// TI products use (README.md): B1-B8. The BouncyCastle peer is
 // testdata/bcpeer/BCPeer.java. The tests need a JDK (java and javac, 11 or
 // later) and the BouncyCastle jars in the directory $IVORY_BCJARS
 // (scripts/fetch-bouncycastle.sh). They are skipped without them, unless
@@ -11,18 +11,23 @@ package interop
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/DominicBreuker/ivory/brainpool"
+	"github.com/DominicBreuker/ivory/ti"
 	"github.com/DominicBreuker/ivory/tlsutil"
 )
 
@@ -107,22 +112,45 @@ func bcFlags(identity, ca, protocol, groups string) []string {
 // it waits until the BCPeer received the greeting.
 func clientWithBCServer(t *testing.T, config *tls.Config, flags ...string) (tls.ConnectionState, string, error) {
 	t.Helper()
+	cs, out, err := clientWithBCServerN(t, config, 1, flags...)
+	return cs[0], out, err
+}
+
+// clientWithBCServerN is clientWithBCServer for n connections in a row, to
+// a BCPeer server with -connections n. It stops at the first error.
+func clientWithBCServerN(t *testing.T, config *tls.Config, n int, flags ...string) ([]tls.ConnectionState, string, error) {
+	t.Helper()
 	addr := freeAddr(t)
-	p := startBC(t, "server", append([]string{"-addr", addr}, flags...)...)
+	p := startBC(t, "server", append([]string{"-addr", addr, "-connections", strconv.Itoa(n)}, flags...)...)
 	if !p.waitFor("listening ") {
 		t.Fatalf("BCPeer didn't start:\n%s", p.output())
 	}
-	cs, err := goClient(addr, config)
-	if err == nil && !p.waitFor("received "+greeting) {
-		err = errors.New("BCPeer didn't receive the greeting")
+	states := make([]tls.ConnectionState, n)
+	for i := range n {
+		cs, err := goClient(addr, config)
+		if err == nil && !p.waitForN("received "+greeting, i+1) {
+			err = errors.New("BCPeer didn't receive the greeting")
+		}
+		if err != nil {
+			return states, p.stop(), fmt.Errorf("connection %d: %w", i+1, err)
+		}
+		states[i] = cs
 	}
-	return cs, p.stop(), err
+	return states, p.stop(), nil
 }
 
 // serverWithBCClient runs a Go server with config against a BCPeer client.
 // On success the server sends the greeting and the function waits until
 // the BCPeer received it.
 func serverWithBCClient(t *testing.T, config *tls.Config, flags ...string) (tls.ConnectionState, string, error) {
+	t.Helper()
+	cs, out, err := serverWithBCClientN(t, config, 1, flags...)
+	return cs[0], out, err
+}
+
+// serverWithBCClientN is serverWithBCClient for n connections in a row
+// from a BCPeer client with -connections n. It stops at the first error.
+func serverWithBCClientN(t *testing.T, config *tls.Config, n int, flags ...string) ([]tls.ConnectionState, string, error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -135,7 +163,7 @@ func serverWithBCClient(t *testing.T, config *tls.Config, flags ...string) (tls.
 		conn net.Conn
 	}
 	results := make(chan result, 1)
-	go func() {
+	serve := func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			results <- result{err: err}
@@ -149,21 +177,29 @@ func serverWithBCClient(t *testing.T, config *tls.Config, flags ...string) (tls.
 		}
 		_, err = io.WriteString(c, greeting+"\n")
 		results <- result{cs: c.ConnectionState(), err: err, conn: conn}
-	}()
-	p := startBC(t, "client", append([]string{"-addr", ln.Addr().String()}, flags...)...)
-	var r result
-	select {
-	case r = <-results:
-	case <-time.After(opTimeout):
-		t.Fatalf("timeout waiting for the Go server; BCPeer:\n%s", p.output())
 	}
-	if r.conn != nil {
-		defer r.conn.Close()
+	p := startBC(t, "client", append([]string{"-addr", ln.Addr().String(), "-connections", strconv.Itoa(n)}, flags...)...)
+	states := make([]tls.ConnectionState, n)
+	for i := range n {
+		go serve()
+		var r result
+		select {
+		case r = <-results:
+		case <-time.After(opTimeout):
+			t.Fatalf("timeout waiting for the Go server; BCPeer:\n%s", p.output())
+		}
+		if r.conn != nil {
+			defer r.conn.Close()
+		}
+		if r.err == nil && !p.waitForN("received "+greeting, i+1) {
+			r.err = errors.New("BCPeer didn't receive the greeting")
+		}
+		if r.err != nil {
+			return states, p.stop(), fmt.Errorf("connection %d: %w", i+1, r.err)
+		}
+		states[i] = r.cs
 	}
-	if r.err == nil && !p.waitFor("received "+greeting) {
-		r.err = errors.New("BCPeer didn't receive the greeting")
-	}
-	return r.cs, p.stop(), r.err
+	return states, p.stop(), nil
 }
 
 func wantBC(t *testing.T, out string, lines ...string) {
@@ -318,4 +354,186 @@ func TestB5ConnectorClientBCServer(t *testing.T) {
 		t.Errorf("version %x, peer certificates %v", cs.Version, cs.PeerCertificates)
 	}
 	wantBC(t, out, "protocol TLSv1.2", "suite TLS_ECDHE_ECDSA_", "peer CN=ivory Brainpool P256 Client")
+}
+
+// B6: a BouncyCastle server with an RSA and a Brainpool identity that
+// trusts an RSA and a Brainpool CA and requires a client certificate, like
+// a Java TI service with both certificate generations: Go clients with an
+// RSA or a Brainpool client certificate, on ECDSA and on RSA suites. The
+// server picks its identity by the suite; client and server key types
+// need not match.
+func TestB6MixedIdentitiesBCServer(t *testing.T) {
+	serverFlags := []string{
+		"-cert", pkiFile("rsa-server.pem") + "," + pkiFile("bp256-server.pem"),
+		"-key", pkiFile("rsa-server.key") + "," + pkiFile("bp256-server.key"),
+		"-ca", pkiFile("rsa-ca.pem") + "," + pkiFile("bp256-ca.pem"),
+		"-protocol", "TLSv1.2", "-groups", "secp256r1,brainpoolP256r1", "-clientauth",
+	}
+	for _, tt := range []struct {
+		name       string
+		suite      uint16
+		client     string // identity in testdata/pki
+		wantServer x509.PublicKeyAlgorithm
+		wantPeer   string // the client certificate as BCPeer prints it
+	}{
+		{"ECDSA suite, Brainpool client", tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, "bp256-client", x509.UnknownPublicKeyAlgorithm, "peer CN=ivory Brainpool P256 Client"},
+		{"ECDSA suite, RSA client", tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, "rsa-client", x509.UnknownPublicKeyAlgorithm, "peer CN=ivory RSA Client"},
+		{"RSA suite, Brainpool client", tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, "bp256-client", x509.RSA, "peer CN=ivory Brainpool P256 Client"},
+		{"RSA suite, RSA client", tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, "rsa-client", x509.RSA, "peer CN=ivory RSA Client"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := brainpoolClient(t, "bp256-client", "bp256-ca")
+			if tt.client == "rsa-client" {
+				cert, err := tls.LoadX509KeyPair(pkiFile("rsa-client.pem"), pkiFile("rsa-client.key"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				config.Certificates = []tls.Certificate{cert}
+			}
+			config.CipherSuites = []uint16{tt.suite}
+			config.VerifyConnection = (&tlsutil.ChainVerifier{
+				Roots:    []*x509.Certificate{readCert(t, "rsa-ca"), readCert(t, "bp256-ca")},
+				KeyUsage: x509.ExtKeyUsageServerAuth,
+			}).VerifyConnection
+			cs, out, err := clientWithBCServer(t, config, serverFlags...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cs.CipherSuite != tt.suite {
+				t.Errorf("cipher suite = %s, want %s", tls.CipherSuiteName(cs.CipherSuite), tls.CipherSuiteName(tt.suite))
+			}
+			if got := cs.PeerCertificates[0].PublicKeyAlgorithm; got != tt.wantServer {
+				t.Errorf("server key %v, want %v", got, tt.wantServer)
+			}
+			wantBC(t, out, "protocol TLSv1.2", tt.wantPeer)
+		})
+	}
+}
+
+// B7: session resumption with the ti session helpers. BCJSSE 1.86 resumes
+// TLS 1.2 sessions by session ID only, and Go only by session ticket (TLS
+// 1.2) or PSK (TLS 1.3), so every connection between them is a full
+// handshake. The tests check that a second connection with the same
+// BouncyCastle SSLContext and the same Go configuration succeeds, and pin
+// that it is not resumed: if a BouncyCastle update starts to resume, the
+// GS-A_5322 limits of the helpers become relevant for it, and this test
+// says so.
+func TestB7SessionResumption(t *testing.T) {
+	const n = 2
+	check := func(t *testing.T, states []tls.ConnectionState) {
+		t.Helper()
+		for i, cs := range states {
+			if cs.DidResume {
+				t.Errorf("connection %d resumed a session; BCJSSE resumes now: check the GS-A_5322 limits with it", i+1)
+			}
+		}
+	}
+	for _, protocol := range []string{"TLSv1.2", "TLSv1.3"} {
+		t.Run("Go server with SessionTickets, "+protocol, func(t *testing.T) {
+			config := brainpoolServer(t, "bp256-server", "bp256-ca")
+			config.KeyExchanges = tlsutil.KeyExchanges(brainpool.P256r1())
+			groups := "brainpoolP256r1"
+			if protocol == "TLSv1.3" {
+				var r schemeRecorder
+				config = tls13Config(config, &r, brainpool.P256r1())
+				groups = "brainpoolP256r1tls13"
+			}
+			if err := (&ti.SessionTickets{}).Enable(config); err != nil {
+				t.Fatal(err)
+			}
+			states, out, err := serverWithBCClientN(t, config, n,
+				append(bcFlags("bp256-client", "bp256-ca", protocol, groups), "-servername", "localhost")...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			check(t, states)
+			if c := strings.Count(out, "protocol "+protocol); c != n {
+				t.Errorf("BCPeer reports %d connections with %s, want %d", c, protocol, n)
+			}
+		})
+		t.Run("Go client with NewClientSessionCache, "+protocol, func(t *testing.T) {
+			config := brainpoolClient(t, "bp256-client", "bp256-ca")
+			groups := "brainpoolP256r1"
+			if protocol == "TLSv1.3" {
+				var r schemeRecorder
+				config = tls13Config(config, &r, brainpool.P256r1())
+				config.CurvePreferences = []tls.CurveID{tlsutil.CurveBrainpoolP256r1TLS13}
+				groups = "brainpoolP256r1tls13"
+			}
+			config.ClientSessionCache = ti.NewClientSessionCache(8, nil)
+			states, out, err := clientWithBCServerN(t, config, n,
+				append(bcFlags("bp256-server", "bp256-ca", protocol, groups), "-clientauth")...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			check(t, states)
+			if c := strings.Count(out, "protocol "+protocol); c != n {
+				t.Errorf("BCPeer reports %d connections with %s, want %d", c, protocol, n)
+			}
+		})
+	}
+}
+
+// B8: the TLS client of gematik's PKI test suite (app-PkiTestsuite 8.1.0,
+// TlsConnection.java) against the ti server presets: BCJSSE, TLS 1.2, the
+// two ECDHE-ECDSA AES-GCM suites, an ECC client certificate, and
+// jdk.tls.namedGroups exactly as the suite sets it, with spaces. The suite
+// counts a completed handshake as acceptance and a fatal alert as
+// rejection, so a server must reject a bad client certificate during the
+// handshake. A crypto/tls server in TLS 1.2 takes the client's first
+// group it supports (ecdheKeyAgreement.generateServerKeyExchange), so the
+// suite's client, which lists brainpoolP256r1 first, gets brainpoolP256r1,
+// and the server's own suite order picks AES-128.
+func TestB8PkiTestsuiteClient(t *testing.T) {
+	const (
+		groups = "brainpoolP256r1, brainpoolP384r1, brainpoolP512r1, secp256r1, secp384r1"
+		suites = "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+	)
+	wantOffered := []tls.CurveID{tlsutil.CurveBrainpoolP256r1, tlsutil.CurveBrainpoolP384r1, tlsutil.CurveBrainpoolP512r1, tls.CurveP256, tls.CurveP384}
+	clientFlags := func(ca string) []string {
+		return []string{"-cert", pkiFile("bp256-client.pem"), "-key", pkiFile("bp256-client.key"),
+			"-ca", pkiFile(ca + ".pem"), "-protocol", "TLSv1.2", "-groups", groups, "-suites", suites}
+	}
+	fachdienst := func(t *testing.T, clientCA string) *tls.Config {
+		return ti.ServerConfig([]tls.Certificate{loadKeyPair(t, "bp256-server")},
+			&ti.Verifier{CAs: []*x509.Certificate{readCert(t, clientCA)}})
+	}
+	// record wraps config's GetCertificate to keep the groups the client
+	// offered.
+	record := func(config *tls.Config, offered *[]tls.CurveID) {
+		get := config.GetCertificate
+		config.GetCertificate = func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			*offered = slices.Clone(chi.SupportedCurves)
+			return get(chi)
+		}
+	}
+	for _, tt := range []struct {
+		name   string
+		config func(t *testing.T) *tls.Config
+	}{
+		{"ti.ServerConfig", func(t *testing.T) *tls.Config { return fachdienst(t, "bp256-ca") }},
+		{"ti.KTServer", ktConfig},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := tt.config(t)
+			var offered []tls.CurveID
+			record(config, &offered)
+			cs, out, err := serverWithBCClient(t, config, clientFlags("bp256-ca")...)
+			if err != nil {
+				t.Fatalf("%v\nBCPeer:\n%s", err, out)
+			}
+			if !slices.Equal(offered, wantOffered) {
+				t.Errorf("client offered groups %v, want %v", offered, wantOffered)
+			}
+			checkPeer(t, cs, "ivory Brainpool P256 Client", tlsutil.CurveBrainpoolP256r1)
+			wantBC(t, out, "protocol TLSv1.2", "suite TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "peer CN=localhost")
+		})
+	}
+	t.Run("ti.ServerConfig rejects an unknown CA", func(t *testing.T) {
+		_, out, err := serverWithBCClient(t, fachdienst(t, "p256-ca"), clientFlags("bp256-ca")...)
+		if err == nil {
+			t.Fatalf("handshake succeeded with a client certificate from an untrusted CA\nBCPeer:\n%s", out)
+		}
+		wantBC(t, out, "error ", "TlsFatalAlertReceived", "bad_certificate")
+	})
 }

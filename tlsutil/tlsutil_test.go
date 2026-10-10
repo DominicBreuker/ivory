@@ -4,10 +4,15 @@ package tlsutil
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,6 +190,108 @@ func TestChainVerifier(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.v.Verify(tt.chain, tt.dnsName)
+			if tt.wantErr == "" && err != nil || tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Errorf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestChainVerifierConstraints checks basic constraints, path lengths and
+// critical extensions, with a P-256 PKI made on the fly.
+func TestChainVerifierConstraints(t *testing.T) {
+	serial := int64(0)
+	type node struct {
+		cert *x509.Certificate
+		key  *ecdsa.PrivateKey
+	}
+	issue := func(cn string, parent *node, mod func(*x509.Certificate)) *node {
+		t.Helper()
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serial++
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+		if mod != nil {
+			mod(tmpl)
+		}
+		issuer, signer := tmpl, key
+		if parent != nil {
+			issuer, signer = parent.cert, parent.key
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, issuer, key.Public(), signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &node{c, key}
+	}
+	ee := func(c *x509.Certificate) {
+		c.IsCA = false
+		c.KeyUsage = x509.KeyUsageDigitalSignature
+		c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	}
+	critical := func(c *x509.Certificate) {
+		c.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 3}, Critical: true, Value: []byte{0x30, 0x00}}}
+	}
+	pathLen0 := func(c *x509.Certificate) { c.MaxPathLen, c.MaxPathLenZero = 0, true }
+
+	root := issue("root", nil, nil)
+	inter := issue("intermediate", root, nil)
+	leaf := issue("leaf", inter, ee)
+	// An end entity that signs a certificate as if it were a CA.
+	notCA := issue("not a CA", root, ee)
+	forged := issue("forged", notCA, ee)
+	noBC := issue("no basic constraints", root, func(c *x509.Certificate) { c.BasicConstraintsValid, c.IsCA = false, false })
+	underNoBC := issue("leaf", noBC, ee)
+	inter0 := issue("intermediate, path length 0", root, pathLen0)
+	inter2 := issue("second intermediate", inter0, nil)
+	leaf2 := issue("leaf", inter2, ee)
+	leaf0 := issue("leaf", inter0, ee)
+	root0 := issue("root, path length 0", nil, pathLen0)
+	interUnder0 := issue("intermediate", root0, nil)
+	leafUnder0 := issue("leaf", interUnder0, ee)
+	criticalLeaf := issue("leaf", inter, func(c *x509.Certificate) { ee(c); critical(c) })
+	criticalInter := issue("intermediate", root, critical)
+	underCritical := issue("leaf", criticalInter, ee)
+
+	chain := func(nodes ...*node) []*x509.Certificate {
+		var cs []*x509.Certificate
+		for _, n := range nodes {
+			cs = append(cs, n.cert)
+		}
+		return cs
+	}
+	for _, tt := range []struct {
+		name    string
+		roots   []*x509.Certificate
+		chain   []*x509.Certificate
+		wantErr string
+	}{
+		{"leaf, intermediate", chain(root), chain(leaf, inter), ""},
+		{"end entity as issuer", chain(root), chain(forged, notCA), "cannot sign"},
+		{"issuer without basic constraints", chain(root), chain(underNoBC, noBC), "cannot sign"},
+		{"intermediate path length 0, one intermediate below", chain(root), chain(leaf2, inter2, inter0), "path length"},
+		{"intermediate path length 0, leaf below", chain(root), chain(leaf0, inter0), ""},
+		{"root path length 0, one intermediate below", chain(root0), chain(leafUnder0, interUnder0), "path length"},
+		{"critical extension in the leaf", chain(root), chain(criticalLeaf, inter), "unhandled critical extension"},
+		{"critical extension in an intermediate", chain(root), chain(underCritical, criticalInter), "unhandled critical extension"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			v := &ChainVerifier{Roots: tt.roots, KeyUsage: x509.ExtKeyUsageServerAuth}
+			err := v.Verify(tt.chain, "")
 			if tt.wantErr == "" && err != nil || tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
 				t.Errorf("err = %v, want %q", err, tt.wantErr)
 			}
