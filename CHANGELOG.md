@@ -5,6 +5,68 @@ a minor version may change APIs. Each version supports one Go release
 (README.md, "Supported Go versions"); a new Go patch release gives a new
 ivory patch version.
 
+## v0.3.0
+
+**Changed (overlay profile kt):**
+
+- A TLS 1.2 CertificateRequest lists only the signature algorithms of
+  its one certificate type: ECDSA and Ed25519 with `ecdsa_sign` on
+  ECDHE_ECDSA suites, RSA with `rsa_sign` on RSA suites. Strict clients
+  rejected the earlier message, which listed RSA algorithms with only
+  `ecdsa_sign`. Clients that sent a client certificate of the other key
+  type, ignoring the certificate type, now send none.
+
+**New command:**
+
+- `cmd/ivory` (experimental: flags and reports may still change): a TLS
+  test tool for TI products. `ivory client` connects once and reports
+  the handshake and the server's certificate chain read the TI way (certificate type, roles from the admission extension, key)
+  with the check against the TSL of the test, reference or production
+  environment and OCSP. `ivory server` reports what each connecting
+  client offers (ClientHello, JA3) and presents. `ivory probe` finds out
+  what a server supports with many narrowed handshakes: versions, cipher
+  suites and their order, TLS 1.2 and TLS 1.3 groups, signature schemes,
+  extensions, fallback protection, its certificates and CertificateRequests.
+  All three print a decoded record-by-record trace, write key logs for
+  Wireshark and report in JSON. Client identities come from PEM files;
+  active connections to the production environment need `-allow-pu`.
+  `client` and `probe` connect through an HTTP or SOCKS5 proxy
+  (`-proxy`, by default from `HTTPS_PROXY`; `socks5h://` for `ssh -D`),
+  and `client` also checks the server's chain against the system's
+  roots.
+- `ivory tunnel` and `ivory proxy` give tools without Brainpool support,
+  such as curl, Brainpool TLS: `tunnel` forwards plain TCP connections
+  from localhost over TLS to one server, `proxy` is an HTTP proxy on
+  localhost that sends requests for `http://` URLs over TLS to their
+  server. Both check the server certificate (the TI way with `-env`,
+  `-tsl` or `-ca`, otherwise against the system's roots) before any data
+  passes, listen on loopback addresses only unless told otherwise, and
+  `proxy` connects only to the targets that `-allow` names. Both connect
+  through `-proxy` like `client`.
+- `ivory reverse` is the other direction: it accepts Brainpool TLS
+  connections and forwards the plain text of each to a server without
+  Brainpool support on a loopback address. With `-client-auth request`
+  or `require`, client certificates are checked against the TSL (or
+  `-tsl`, `-ca`) and a failed check fails the handshake.
+- `-proxy env` falls back to `ALL_PROXY` and honours `NO_PROXY` entries
+  for domains and their subdomains, `host:port`, IP addresses and CIDR
+  ranges; loopback targets never use the proxy. The TSL and OCSP
+  downloads go through the same proxy (`server` and `reverse` take
+  `-proxy` for them).
+
+**Documentation:** a first-steps walk-through for `ivory` with the test
+PKI, a section on the tool in the user guide, what the tool trusts in
+docs/security.md (Section 8), and the TSL, OCSP and tool code in the
+scope of SECURITY.md.
+
+**Overlay tool:** `ivory-overlay pin` accepts a patch that changes a file
+an earlier patch adds.
+
+**CI:** `ci.yml` runs on pushes to `main` and on demand, no longer on
+every branch and pull request; the Windows SChannel jobs run on demand
+only. Scheduled `nightly.yml` runs do their work only in a public
+repository; anywhere, the workflow can be started by hand.
+
 ## v0.2.0
 
 **New packages:**

@@ -10,7 +10,9 @@
 // state machine instead of failing the handshake (A_22890). Build it with
 // the ivory overlay, profile kt, for the KT-only behavior: renegotiation is
 // refused with no_renegotiation (P0, GS-A_5524), the CertificateRequest
-// carries one certificate type (P6, A_22454).
+// carries one certificate type and only its signature schemes (P6,
+// A_22454), so a Konnektor with a Brainpool certificate sends none on RSA
+// suites.
 //
 // Usage, with the test PKI of this repository:
 //

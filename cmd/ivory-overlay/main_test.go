@@ -77,6 +77,25 @@ func TestParsePatchErrors(t *testing.T) {
 	}
 }
 
+// TestPristineFiles checks that a file an earlier patch adds is not expected
+// in GOROOT when a later patch changes it.
+func TestPristineFiles(t *testing.T) {
+	first, err := parsePatch("0000-a.patch", []byte(testPatch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := parsePatch("0100-b.patch", []byte("--- a/src/pkg/b.go\n+++ b/src/pkg/b.go\n@@ -1 +1 @@\n-package a\n+package b\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := pristineFiles([]*patch{first, second}), []string{"src/pkg/a.go"}; !slices.Equal(got, want) {
+		t.Errorf("pristineFiles = %q, want %q", got, want)
+	}
+	if got, want := pristineFiles([]*patch{second, first}), []string{"src/pkg/a.go", "src/pkg/b.go"}; !slices.Equal(got, want) {
+		t.Errorf("pristineFiles in reverse order = %q, want %q", got, want)
+	}
+}
+
 // TestRealPatches parses the module's patches and compares the files with
 // what a line-based scan finds ("--- a/" and "+++ b/" lines).
 func TestRealPatches(t *testing.T) {

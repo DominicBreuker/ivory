@@ -15,14 +15,19 @@ specified by gematik) requires. It keeps Go's own `crypto/tls` and
   (brainpoolP256r1, XMLDSig), the trust space update, and OCSP responses
   signed by Brainpool responders; an example server passes gematik's
   PKI test suite (all 111 tests of its KIM Fachdienst profile).
+- [`ivory`](cmd/ivory), a command-line TLS test tool (experimental):
+  connect to TI products, accept their connections and probe what they
+  support, with decoded handshake traces; and local tunnels that give
+  curl and other tools without Brainpool support Brainpool TLS.
 - Tested against OpenSSL 3.0 and 3.5, BouncyCastle's TLS provider for
   Java, Windows SChannel (TLS 1.2) and Go itself, with Go's own
   `crypto/tls` and `crypto/x509` test suites, BoringSSL's BoGo,
   tlsfuzzer, x509-limbo, Wycheproof, the RFC and Botan Brainpool test
   vectors, and fuzzing.
 
-> **Status: v0.2.** ivory has had a careful self-review, not an external
-> security review, and hasn't been tested against real TI products yet. APIs may change before v1.0. Please read
+> **Status: v0.3.** ivory has had a careful self-review, not an external
+> security review, and hasn't been tested against real TI products yet.
+> APIs may change before v1.0. Please read
 > [docs/security.md](docs/security.md) before you rely on it, and
 > [tell us](#feedback) how it works with your peers.
 
@@ -76,7 +81,7 @@ sets `GOFLAGS="-overlay=… -tags=ivory,ivory_core"` and
 mkdir ~/tlsdemo && cd ~/tlsdemo
 eval "$(~/ivory/scripts/ivory-overlay env -profile core)"
 go mod init example.com/tlsdemo
-go get github.com/DominicBreuker/ivory@v0.2.0   # the version of your ivory checkout
+go get github.com/DominicBreuker/ivory@v0.3.0   # the version of your ivory checkout
 # A Brainpool test identity and its CA from ivory's test PKI:
 cp ~/ivory/testdata/pki/bp256-server.pem server.pem
 cp ~/ivory/testdata/pki/bp256-server.key server.key
@@ -172,9 +177,12 @@ hello over Brainpool TLS
 ```
 
 Next: [docs/user-guide.md](docs/user-guide.md) (smart cards, the KT
-preset, TLS 1.3, editors, CI), and the runnable examples
-[examples/ktserver](examples/ktserver) and
-[examples/connectorclient](examples/connectorclient).
+preset, TLS 1.3, TSL and OCSP, editors, CI), and the runnable examples
+[examples/ktserver](examples/ktserver),
+[examples/connectorclient](examples/connectorclient) and
+[examples/fachdienst](examples/fachdienst): the comment at the top of
+each `main.go` shows how to run it. To try Brainpool TLS without writing
+code, build the [`ivory` tool](cmd/ivory/README.md#first-steps).
 
 ### The `ivory` build tag
 
@@ -218,7 +226,8 @@ opt-in, fails closed, and is off in FIPS 140-3 mode.
 
 ## Testing
 
-CI ([.github/workflows](.github/workflows)) runs on every push:
+CI ([.github/workflows](.github/workflows)) runs on every push to `main`
+(the Windows job on demand):
 
 - Go's own `crypto/x509` and `crypto/tls` tests under the overlay, for
   both profiles, including the tests each patch adds; `go vet` of both
@@ -235,9 +244,10 @@ CI ([.github/workflows](.github/workflows)) runs on every push:
 - tlsfuzzer's Brainpool scripts and its ECDSA scripts with Brainpool
   identities against ivory servers (F1–F6 in
   [interop/README.md](interop/README.md));
-- Windows SChannel through .NET's `SslStream` on Windows Server 2025,
-  both roles (S1–S7: TLS 1.2 works; SChannel's TLS 1.3 isn't RFC 8734;
-  `tlsutil.TLS12Fallback` for servers that also offer TLS 1.3);
+- Windows SChannel through .NET's `SslStream` on Windows Server 2025
+  (on demand), both roles (S1–S7: TLS 1.2 works; SChannel's TLS 1.3
+  isn't RFC 8734; `tlsutil.TLS12Fallback` for servers that also offer
+  TLS 1.3);
 - `tsl` against 136 archived production, reference and test TSLs;
 - wire probes of what crypto/tls sends ([probe/README.md](probe/README.md));
 - BoGo's renegotiation tests.
@@ -255,12 +265,18 @@ constant-time review of the Brainpool code.
 
 - [docs/user-guide.md](docs/user-guide.md): the overlay or a materialized
   GOROOT, your own module, TLS 1.2 for the TI, TLS 1.3 with Brainpool,
-  TSL and OCSP, editors, CI, new Go releases, troubleshooting.
+  TSL and OCSP, the test tool, editors, CI, new Go releases,
+  troubleshooting.
 - [docs/security.md](docs/security.md): what the patches change, what is
   constant time, random numbers, erasure of secrets, protocol choices,
-  the TSL and OCSP checks.
+  the TSL and OCSP checks, what the test tool trusts.
 - [docs/compliance.md](docs/compliance.md): TI requirements, the
   mechanism that meets each, and its tests.
+- [cmd/ivory/README.md](cmd/ivory/README.md): `ivory`, the test tool
+  (experimental): connect to TI products, accept their connections,
+  probe what they support, with handshake traces; a local tunnel and
+  HTTP proxy that give other tools, such as curl, Brainpool TLS; and a
+  reverse tunnel that gives other servers Brainpool TLS.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version.
 
 ## Feedback
@@ -281,6 +297,7 @@ explains how changes are made.
 | `overlay/` | patches, profiles, pinned file hashes, and the patch documentation |
 | `cmd/ivory-overlay/` | the overlay tool: fetch the toolchain, check pins, build the overlay or a patched GOROOT, test, adopt new Go releases (a module of its own, so that any Go ≥ 1.22 builds it) |
 | `scripts/` | `ivory-overlay` (builds and runs the tool), `gen-testpki.sh` (the test PKI), `build-openssl.sh` (OpenSSL from source for the TLS 1.3 tests), `fetch-bouncycastle.sh` (the BouncyCastle jars for the Java interop tests), `fetch-gemlibpki.sh` (certificates and TSLs of the TI test PKI for the `ti` and `tsl` tests), `run-pkits.sh` (gematik's PKI test suite against `examples/fachdienst`), `fetch-production-tsl.sh` (today's production, reference or test TSL and its trust anchor), `fetch-tsl-corpus.sh` (archived TSLs for the `tsl` tests), `fetch-tlsfuzzer.sh` (tlsfuzzer for the interop tests F1–F6) |
+| `cmd/ivory/` | `ivory` (experimental), a TLS test client, server and prober for TI products, with handshake traces and the TI check of peer certificates, a tunnel and HTTP proxy that give other tools Brainpool TLS, and a reverse tunnel for other servers |
 | `examples/` | a card terminal server, a Konnektor-like client, and a TI server that checks clients against the TSL with OCSP |
 | `interop/`, `probe/` | interop tests and wire probes |
 | `testdata/pki/` | test certificates and keys (Brainpool, P-256, RSA); test only |

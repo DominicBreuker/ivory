@@ -1,7 +1,7 @@
 # ivory security notes
 
 What ivory guarantees, what it relies on, and what it leaves to the
-product that uses it. The [user guide](user-guide.md) shows how to use it;
+product that uses it; Section 8 covers the `ivory` test tool. The [user guide](user-guide.md) shows how to use it;
 [compliance.md](compliance.md) maps TI requirements to code and tests.
 
 > **Status:** ivory has had a self-review, not an external one. Get an
@@ -194,3 +194,52 @@ the product:
   from the schema of ETSI TS 102 231, not a general XML Schema
   validator; QES checks (BNetzA-VL, TUC_PKI_030) and CRL-based checks of
   the TSL are not implemented.
+
+## 8. The ivory test tool
+
+`cmd/ivory` is a diagnostic tool for test environments, and it is
+experimental. It uses the library's checks, but several of its commands
+report a failed check instead of acting on it, on purpose:
+
+- **Reports, not decisions.** `client` completes the handshake, with
+  your client certificate if one fits, and sends the `-http` request
+  before it checks the server's certificate; a failed check shows in the
+  report and the exit status (3), after the fact. `probe` checks no
+  server certificate before it sends its ClientHellos and reports the
+  chains it saw. `server` accepts any client certificate whose key the
+  client proves it holds, and only reports its check. Don't use these
+  commands to send anything to a server you don't trust.
+- **Where a check decides.** `tunnel` and `proxy` check the server's
+  certificate before any data passes and close the connection when the
+  check fails; `-verify none` turns the check off and says so in every
+  report. `reverse` with `-client-auth request` or `require` fails the
+  handshake of a client whose certificate fails the check, and resumes
+  no sessions, so every connection is checked.
+- **Trust.** `-env` trusts the TSL of that environment: the TSL
+  signature is checked against a trust anchor whose SHA-256 fingerprint
+  is pinned in the tool, on every start, also for a cached TSL. The
+  fingerprints are those that the TSL service publishes; confirm them
+  through an independent channel before you rely on a result (gemSpec_PKI
+  GS-A_4640). `-trust-anchor` replaces the pinned anchor with the file
+  you give, and `-ca` trusts the given CA certificates without TSL or
+  OCSP. The TSL cache in your user cache directory is not protected
+  beyond the TSL's signature: whoever can write to it can put an older
+  TSL there that is still valid (`-refresh-tsl` downloads the current
+  one).
+- **Plain text on the local side.** `tunnel` and `proxy` accept plain
+  connections and use your client certificate for them; `reverse` sends
+  plain text to its backend. They accept only loopback addresses on the
+  plain side unless you give `-allow-remote`: then anyone who can reach
+  that address can use your identity, or read the backend traffic.
+  `proxy` connects only to targets that match an `-allow` rule.
+- **Secrets on disk.** `-key` files hold unencrypted private keys, as
+  the tool reads them; use test identities. `-keylog` files (created
+  with mode 0600) contain the session secrets: with one, anyone who has
+  a capture of the traffic can decrypt it. Delete them after use. A
+  proxy password in `-proxy` is visible in the process list; reports
+  name the proxy without it.
+- **The production environment.** Products in the production
+  environment serve patients. `client`, `probe`, `tunnel` and `proxy`
+  refuse `-env pu` without `-allow-pu`; use it only with the operator's
+  permission. `probe` makes about 90 connections and sends unusual
+  ClientHellos: probe only servers you may test.

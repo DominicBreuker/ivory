@@ -6,25 +6,51 @@ A_22454 requires an eHealth card terminal to send exactly one type:
 ecdsa_sign on ECDHE_ECDSA suites, rsa_sign on RSA suites. A Go client
 then picks the client certificate that matches the suite.
 
-This refuses RSA client certificates on ECDSA suites (and the reverse)
-for clients that follow certificate_types, which TLS 1.2 allows. It is
-for the overlay profile of eHealth card terminals only and is not meant
-for upstream.
+supported_signature_algorithms lists only the algorithms of that type:
+ECDSA and Ed25519 (RFC 8422, Section 5.5) with ecdsa_sign, RSA with
+rsa_sign. RFC 5246 doesn't require the two lists to agree, but strict
+clients (tlslite-ng) reject a CertificateRequest whose algorithms need a
+certificate type it doesn't list, and the server refuses a
+CertificateVerify whose algorithm it didn't offer.
+
+This refuses RSA client certificates on ECDSA suites (and the reverse),
+which TLS 1.2 allows. It is for the overlay profile of eHealth card
+terminals only and is not meant for upstream.
 
 The TLS 1.2 TestClientAuth recordings were regenerated with OpenSSL
 1.1.1w (as handshake_test.go requires); the RSA client certificate cases
 and TestPKCS1OnlyCert now use a server with an RSA certificate, so that
-the suite asks for RSA certificates.
+the suite asks for RSA certificates. The CertificateVerify test of
+VerifyUnsupportedSignature uses Ed25519 instead of an RSA scheme, which
+the server no longer offers on its ECDSA suite. Five BoGo tests in
+which a client signs with an ECDSA or Ed25519 key towards a server with
+an RSA certificate are disabled.
 
 ivory: P6, profile kt only. Base: go1.27.2 with P0-P5.
 Requirement: A_22454 (gemSpec_Krypt V2.51.0). Upstream: never.
 Probe: K3.
 
+diff --git a/src/crypto/tls/bogo_config.json b/src/crypto/tls/bogo_config.json
+--- a/src/crypto/tls/bogo_config.json
++++ b/src/crypto/tls/bogo_config.json
+@@ -2,6 +2,12 @@
+     "DisabledTests": {
+         "*-Async": "We don't support boringssl concept of async",
+ 
++        "TLS12-Server-ClientAuth-ECDSA": "eHealth-KT (gemSpec_Krypt A_22454): on a TLS 1.2 RSA suite, the server offers only RSA signature algorithms for client certificates",
++        "Server-Verify-ECDSA_P256_SHA256-TLS12": "eHealth-KT (gemSpec_Krypt A_22454): on a TLS 1.2 RSA suite, the server offers only RSA signature algorithms for client certificates",
++        "Server-Verify-ECDSA_P384_SHA384-TLS12": "eHealth-KT (gemSpec_Krypt A_22454): on a TLS 1.2 RSA suite, the server offers only RSA signature algorithms for client certificates",
++        "Server-Verify-ECDSA_P521_SHA512-TLS12": "eHealth-KT (gemSpec_Krypt A_22454): on a TLS 1.2 RSA suite, the server offers only RSA signature algorithms for client certificates",
++        "Server-Verify-Ed25519-TLS12": "eHealth-KT (gemSpec_Krypt A_22454): on a TLS 1.2 RSA suite, the server offers only RSA signature algorithms for client certificates",
++
+         "TLS-ECH-Client-Reject-NoClientCertificate-TLS12": "We won't attempt to negotiate 1.2 if ECH is enabled",
+         "TLS-ECH-Client-Reject-TLS12": "We won't attempt to negotiate 1.2 if ECH is enabled",
+         "TLS-ECH-Client-TLS12-RejectRetryConfigs": "We won't attempt to negotiate 1.2 if ECH is enabled",
 diff --git a/src/crypto/tls/certificate_types_test.go b/src/crypto/tls/certificate_types_test.go
 new file mode 100644
 --- /dev/null
 +++ b/src/crypto/tls/certificate_types_test.go
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,109 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -34,16 +60,19 @@ new file mode 100644
 +import (
 +	"bytes"
 +	"net"
++	"slices"
 +	"sync"
 +	"testing"
 +)
 +
 +// certificateRequestRecorder is a net.Conn that records the
-+// certificate_types of the TLS 1.2 CertificateRequest it writes.
++// certificate_types and supported_signature_algorithms of the TLS 1.2
++// CertificateRequest it writes.
 +type certificateRequestRecorder struct {
 +	net.Conn
 +	mu        sync.Mutex
 +	certTypes []byte
++	sigAlgs   []SignatureScheme
 +}
 +
 +func (c *certificateRequestRecorder) Write(b []byte) (int, error) {
@@ -56,6 +85,12 @@ new file mode 100644
 +			body := rec[recordHeaderLen+4 : n]
 +			c.mu.Lock()
 +			c.certTypes = bytes.Clone(body[1 : 1+int(body[0])])
++			algs := body[1+int(body[0]):]
++			algs = algs[2 : 2+(int(algs[0])<<8|int(algs[1]))]
++			c.sigAlgs = nil
++			for ; len(algs) >= 2; algs = algs[2:] {
++				c.sigAlgs = append(c.sigAlgs, SignatureScheme(algs[0])<<8|SignatureScheme(algs[1]))
++			}
 +			c.mu.Unlock()
 +		}
 +		rec = rec[n:]
@@ -65,18 +100,24 @@ new file mode 100644
 +
 +// TestCertificateRequestTypes checks that a TLS 1.2 server asks for exactly
 +// one client certificate type, the one that matches the cipher suite
-+// (gemSpec_Krypt A_22454), and that a client with both certificate types
-+// sends the matching one.
++// (gemSpec_Krypt A_22454), offers only the signature algorithms of that
++// type, and that a client with both certificate types sends the matching
++// one.
 +func TestCertificateRequestTypes(t *testing.T) {
 +	for _, tt := range []struct {
 +		name      string
 +		suite     uint16
 +		cert      Certificate
 +		wantTypes []byte
++		wantSigs  []SignatureScheme
 +		wantLeaf  Certificate
 +	}{
-+		{"ECDHE_ECDSA", TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, testECDSAP256Cert, []byte{certTypeECDSASign}, testClientECDSAP256Cert},
-+		{"ECDHE_RSA", TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, testRSA2048Cert, []byte{certTypeRSASign}, testClientRSA2048Cert},
++		{"ECDHE_ECDSA", TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, testECDSAP256Cert, []byte{certTypeECDSASign},
++			[]SignatureScheme{ECDSAWithP256AndSHA256, Ed25519, ECDSAWithP384AndSHA384, ECDSAWithP521AndSHA512},
++			testClientECDSAP256Cert},
++		{"ECDHE_RSA", TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, testRSA2048Cert, []byte{certTypeRSASign},
++			[]SignatureScheme{PSSWithSHA256, PSSWithSHA384, PSSWithSHA512, PKCS1WithSHA256, PKCS1WithSHA384, PKCS1WithSHA512},
++			testClientRSA2048Cert},
 +	} {
 +		t.Run(tt.name, func(t *testing.T) {
 +			serverConfig := testConfigServer.Clone()
@@ -110,6 +151,9 @@ new file mode 100644
 +			if !bytes.Equal(rec.certTypes, tt.wantTypes) {
 +				t.Errorf("certificate_types = %x, want %x", rec.certTypes, tt.wantTypes)
 +			}
++			if !slices.Equal(rec.sigAlgs, tt.wantSigs) {
++				t.Errorf("supported_signature_algorithms = %v, want %v", rec.sigAlgs, tt.wantSigs)
++			}
 +			if !bytes.Equal(peer, tt.wantLeaf.Certificate[0]) {
 +				t.Error("client sent the certificate of the other type")
 +			}
@@ -119,7 +163,15 @@ new file mode 100644
 diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_server.go
 --- a/src/crypto/tls/handshake_server.go
 +++ b/src/crypto/tls/handshake_server.go
-@@ -663,9 +663,13 @@ func (hs *serverHandshakeState) doFullHandshake() error {
+@@ -18,6 +18,7 @@ import (
+ 	"fmt"
+ 	"hash"
+ 	"io"
++	"slices"
+ 	"time"
+ )
+ 
+@@ -663,13 +664,24 @@ func (hs *serverHandshakeState) doFullHandshake() error {
  	if c.config.ClientAuth >= RequestClientCert {
  		// Request a client certificate
  		certReq = new(certificateRequestMsg)
@@ -129,13 +181,25 @@ diff --git a/src/crypto/tls/handshake_server.go b/src/crypto/tls/handshake_serve
 +		// Send exactly one certificate type, the one that matches the
 +		// cipher suite, as gemSpec_Krypt A_22454 requires of an
 +		// eHealth-KT. TLS 1.2 allows both on every suite.
-+		if hs.suite.flags&suiteECSign != 0 {
++		ecSign := hs.suite.flags&suiteECSign != 0
++		if ecSign {
 +			certReq.certificateTypes = []byte{byte(certTypeECDSASign)}
 +		} else {
 +			certReq.certificateTypes = []byte{byte(certTypeRSASign)}
  		}
  		if c.vers >= VersionTLS12 {
  			certReq.hasSignatureAlgorithm = true
+-			certReq.supportedSignatureAlgorithms = c.config.supportedSignatureAlgorithms(c.vers, c.vers)
++			// Offer only the signature algorithms of that certificate
++			// type, so that the two lists agree. ecdsa_sign also
++			// covers Ed25519 (RFC 8422, Section 5.5).
++			certReq.supportedSignatureAlgorithms = slices.DeleteFunc(c.config.supportedSignatureAlgorithms(c.vers, c.vers), func(s SignatureScheme) bool {
++				sigType, _, err := typeAndHashFromSignatureScheme(s)
++				return err != nil || (sigType == signatureECDSA || sigType == signatureEd25519) != ecSign
++			})
+ 		}
+ 
+ 		// An empty list of certificateAuthorities signals to
 diff --git a/src/crypto/tls/handshake_server_test.go b/src/crypto/tls/handshake_server_test.go
 --- a/src/crypto/tls/handshake_server_test.go
 +++ b/src/crypto/tls/handshake_server_test.go
@@ -178,13 +242,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGi
 -00000000  16 03 01 00 d5 01 00 00  d1 03 03 91 05 3d 04 e9  |.............=..|
 -00000010  6b 4b 94 88 f5 5c 9c 50  ee 76 d2 7c 81 1f 47 f4  |kK...\.P.v.|..G.|
 -00000020  25 a7 7e b1 dc 0d 77 e2  d3 d6 e5 00 00 38 c0 2c  |%.~...w......8.,|
-+00000000  16 03 01 00 d5 01 00 00  d1 03 03 d9 b1 a3 5b bc  |..............[.|
-+00000010  7f 1d 91 e0 2e 4e 6f e9  89 03 9c a9 ba 83 31 ce  |.....No.......1.|
-+00000020  0c a6 38 fd 12 a8 b9 ac  d5 b5 e8 00 00 38 c0 2c  |..8..........8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 4d 32 e9 24 4a  |...........M2.$J|
++00000010  37 85 ed ad f0 2b 02 57  36 e7 e8 f9 97 3e e3 e4  |7....+.W6....>..|
++00000020  59 99 fc 3f 59 25 dd 50  44 69 0e 00 00 38 c0 2c  |Y..?Y%.PDi...8.,|
  00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
  00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
  00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
-@@ -56,15 +56,15 @@
+@@ -56,18 +56,18 @@
  00000270  b2 6f 7a a1 46 b0 dd 56  7c a0 ef 4b c0 00 60 65  |.oz.F..V|..K..`e|
  00000280  11 6e d0 e0 77 47 77 f2  d7 9c 04 45 bb 82 eb 4e  |.n..wGw....E...N|
  00000290  f5 da 16 43 4d 45 c7 c7  e4 9b 08 2e d4 b4 6b 1f  |...CME........k.|
@@ -198,15 +262,21 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGi
 -00000300  fc 8d 80 c2 52 22 a8 b9  ff d2 ef 32 1f e9 0f d0  |....R".....2....|
 -00000310  79 25 99 69 8e c6 28 2b  cf 16 03 03 00 39 0d 00  |y%.i..(+.....9..|
 -00000320  00 35 02 01 40 00 14 08  04 04 03 08 07 08 05 08  |.5..@...........|
-+000002d0  03 00 47 30 45 02 21 00  e8 a1 ac a2 5b 7a db 49  |..G0E.!.....[z.I|
-+000002e0  ed 62 29 1f 32 25 20 07  ca 80 34 9e 59 a3 b4 7c  |.b).2% ...4.Y..||
-+000002f0  ec 3b 93 76 85 f1 d9 42  02 20 04 b9 81 0c 55 5c  |.;.v...B. ....U\|
-+00000300  96 f4 2b 72 80 ea ca 7f  64 63 26 af b6 4a 6b 21  |..+r....dc&..Jk!|
-+00000310  bf 0e e0 11 74 aa 6a 81  6b 41 16 03 03 00 38 0d  |....t.j.kA....8.|
-+00000320  00 00 34 01 40 00 14 08  04 04 03 08 07 08 05 08  |..4.@...........|
- 00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
- 00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
- 00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
+-00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
+-00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
+-00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
++000002d0  03 00 47 30 45 02 20 11  33 ec 7c 01 4b 11 f6 b6  |..G0E. .3.|.K...|
++000002e0  43 cf 6a 89 e7 69 07 02  33 ac 44 b3 0a 07 62 bb  |C.j..i..3.D...b.|
++000002f0  d7 7c d3 f8 29 92 dc 02  21 00 8c d5 94 4e 9e 7b  |.|..)...!....N.{|
++00000300  90 23 73 18 73 c5 16 bd  9f 24 46 97 e6 92 be 53  |.#s.s....$F....S|
++00000310  91 36 bd 3c dd 0f ec 6c  b3 95 16 03 03 00 2c 0d  |.6.<...l......,.|
++00000320  00 00 28 01 40 00 08 04  03 08 07 05 03 06 03 00  |..(.@...........|
++00000330  1a 00 18 30 16 31 14 30  12 06 03 55 04 03 13 0b  |...0.1.0...U....|
++00000340  43 6c 69 65 6e 74 20 52  6f 6f 74 16 03 03 00 04  |Client Root.....|
++00000350  0e 00 00 00                                       |....|
+ >>> Flow 3 (client to server)
+ 00000000  16 03 03 02 6b 0b 00 02  67 00 02 64 00 02 61 30  |....k...g..d..a0|
+ 00000010  82 02 5d 30 82 01 45 a0  03 02 01 02 02 01 0d 30  |..]0..E........0|
 @@ -108,22 +108,22 @@
  00000240  3e 33 20 6d 15 44 4a d8  ae bb e4 8a cd ea 9b b0  |>3 m.DJ.........|
  00000250  1f 1a 10 43 ad 0d 07 85  bb 41 6b 35 7f 2b 41 d1  |...C.....Ak5.+A.|
@@ -222,17 +292,17 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGi
 -000002f0  03 03 00 01 01 16 03 03  00 20 c4 de b9 a7 0e 5d  |......... .....]|
 -00000300  b0 94 18 6e 0b 59 4a 72  bb 03 7b 32 c3 94 c8 e4  |...n.YJr..{2....|
 -00000310  ef 1e ea 24 95 41 97 7c  42 ed                    |...$.A.|B.|
-+00000270  16 03 03 00 25 10 00 00  21 20 03 dd 3f 8a 47 92  |....%...! ..?.G.|
-+00000280  a0 c4 3b 1e 3a 6a b8 78  4e 64 76 66 4d 33 d3 80  |..;.:j.xNdvfM3..|
-+00000290  d6 81 17 2b 3f 15 00 35  cd 5c 16 03 03 00 4f 0f  |...+?..5.\....O.|
-+000002a0  00 00 4b 04 03 00 47 30  45 02 21 00 c5 a1 94 50  |..K...G0E.!....P|
-+000002b0  5e 77 f3 df bf d5 af a3  8a 52 34 74 ad c5 30 35  |^w.......R4t..05|
-+000002c0  cf 45 8d c2 91 a9 c0 71  b2 b0 f1 1f 02 20 71 50  |.E.....q..... qP|
-+000002d0  6c a9 24 aa 82 1c b5 88  f2 76 df e0 02 17 56 d7  |l.$......v....V.|
-+000002e0  14 22 5c 2d 42 63 ce bb  d2 0f 94 d5 64 fb 14 03  |."\-Bc......d...|
-+000002f0  03 00 01 01 16 03 03 00  20 82 2e 15 ae 8d 4b f2  |........ .....K.|
-+00000300  5a e2 60 d7 7b df aa cb  cf f8 a8 46 08 08 05 31  |Z.`.{......F...1|
-+00000310  ae f8 07 5e 6f ff 63 e9  75                       |...^o.c.u|
++00000270  16 03 03 00 25 10 00 00  21 20 50 e9 0d c3 2b 53  |....%...! P...+S|
++00000280  7f 4f 00 02 88 1d 95 5d  49 7d ea 56 cf 46 41 f3  |.O.....]I}.V.FA.|
++00000290  e3 10 f7 b4 4f 1b 9d 91  65 08 16 03 03 00 4f 0f  |....O...e.....O.|
++000002a0  00 00 4b 04 03 00 47 30  45 02 21 00 ad 9f 47 50  |..K...G0E.!...GP|
++000002b0  41 b3 6b 76 36 94 85 f3  eb 48 33 b4 b3 d9 52 a4  |A.kv6....H3...R.|
++000002c0  03 ba 90 65 48 9b 15 d4  5b b3 81 55 02 20 4e cd  |...eH...[..U. N.|
++000002d0  bb f4 70 40 3c 75 6c 49  d7 fb ed 93 b1 be 1e a4  |..p@<ulI........|
++000002e0  60 a2 7f bd 8f 91 b4 7a  e3 8b 1e 52 40 7a 14 03  |`......z...R@z..|
++000002f0  03 00 01 01 16 03 03 00  20 f0 dc ee 9a 59 ec bc  |........ ....Y..|
++00000300  4c f9 a5 53 e7 5b d2 d1  46 fd d2 f8 71 10 de 2b  |L..S.[..F...q..+|
++00000310  50 7e 51 63 ca f5 13 4b  f2                       |P~Qc...K.|
  >>> Flow 4 (server to client)
 -00000000  14 03 03 00 01 01 16 03  03 00 20 55 30 1e a5 e0  |.......... U0...|
 -00000010  6b 2f 60 6e 4a d0 24 ad  33 a8 93 1d 84 c9 83 4d  |k/`nJ.$.3......M|
@@ -241,13 +311,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndECDSAGi
 -00000040  d2 77 d2 41 bb e3 a9 e6  bf 75 51 aa cb 15 03 03  |.w.A.....uQ.....|
 -00000050  00 12 7b 42 7c 52 40 98  61 2d 41 80 31 83 b1 05  |..{B|R@.a-A.1...|
 -00000060  5e 44 13 c1                                       |^D..|
-+00000000  14 03 03 00 01 01 16 03  03 00 20 39 e9 c7 8a 29  |.......... 9...)|
-+00000010  2e c4 b7 83 19 79 42 cf  5f 1a 73 d5 bc e8 58 2a  |.....yB._.s...X*|
-+00000020  b4 38 e7 45 35 6a 12 7a  da b6 46 17 03 03 00 1d  |.8.E5j.z..F.....|
-+00000030  18 79 8e b6 32 ad 8b 12  b4 91 fe 98 f8 24 76 9d  |.y..2........$v.|
-+00000040  66 3d 62 f7 b8 c3 34 0a  6b 3e fc ec 2a 15 03 03  |f=b...4.k>..*...|
-+00000050  00 12 f2 fe e4 2c 0f aa  98 a0 7b 5d 10 f6 05 2d  |.....,....{]...-|
-+00000060  15 6c 4b 4f                                       |.lKO|
++00000000  14 03 03 00 01 01 16 03  03 00 20 0f fc b5 2b 1c  |.......... ...+.|
++00000010  7d 6b b9 e1 b2 bd f1 4b  25 43 fb 7c a1 7d 1b 06  |}k.....K%C.|.}..|
++00000020  7e 8e d7 fc 25 b4 c0 7c  af 20 e2 17 03 03 00 1d  |~...%..|. ......|
++00000030  9e 89 8f 49 b1 0a af 87  19 a7 f6 d2 5e 9a 3a 49  |...I........^.:I|
++00000040  a6 99 8e 4b 67 9e 28 20  e6 55 3c 65 d6 15 03 03  |...Kg.( .U<e....|
++00000050  00 12 54 17 2d 76 9d dc  7d d1 f7 00 06 33 88 5b  |..T.-v..}....3.[|
++00000060  d9 d0 12 eb                                       |....|
 diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given
 --- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given
 +++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519Given
@@ -256,9 +326,9 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519
 -00000000  16 03 01 00 d5 01 00 00  d1 03 03 3c b7 90 aa bf  |...........<....|
 -00000010  bf c1 45 ce 4f dc 91 11  ef 90 a9 08 7f 3b 6d 27  |..E.O........;m'|
 -00000020  34 09 c0 76 ff 4a 37 62  ad ee 9e 00 00 38 c0 2c  |4..v.J7b.....8.,|
-+00000000  16 03 01 00 d5 01 00 00  d1 03 03 4c 07 fc 5b c0  |...........L..[.|
-+00000010  f0 fc 44 8a 6f ad 19 09  d8 45 04 0e 3c 23 9e 31  |..D.o....E..<#.1|
-+00000020  e8 35 68 b8 46 13 cf 1e  cb d5 87 00 00 38 c0 2c  |.5h.F........8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 89 5e 37 02 18  |............^7..|
++00000010  a9 7a 51 5b aa 32 0c 89  45 5c ff 73 79 5f 20 87  |.zQ[.2..E\.sy_ .|
++00000020  71 2c d5 97 98 c8 1b e4  c4 50 e7 00 00 38 c0 2c  |q,.......P...8.,|
  00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
  00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
  00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
@@ -276,15 +346,15 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519
 -00000340  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
 -00000350  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
 -00000360  00                                                |.|
-+000002d0  03 00 47 30 45 02 21 00  83 15 be f1 ae c8 ab 33  |..G0E.!........3|
-+000002e0  e1 05 a0 e3 0e b4 d3 1e  16 85 85 90 5e bd 10 05  |............^...|
-+000002f0  fc 84 1e 7e 19 21 7a ef  02 20 6c 94 e6 f5 a2 85  |...~.!z.. l.....|
-+00000300  21 81 97 56 c8 65 12 82  1e 6d 4a bc 14 e0 73 f2  |!..V.e...mJ...s.|
-+00000310  6e 28 96 99 77 8d 66 f2  20 4c 16 03 03 00 38 0d  |n(..w.f. L....8.|
-+00000320  00 00 34 01 40 00 14 08  04 04 03 08 07 08 05 08  |..4.@...........|
-+00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
-+00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
-+00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
++000002d0  03 00 47 30 45 02 20 73  c9 18 98 8a 9b af 38 49  |..G0E. s......8I|
++000002e0  f0 39 c6 73 c6 f1 28 db  b1 f1 63 6a 54 eb 55 0d  |.9.s..(...cjT.U.|
++000002f0  9f e8 c9 aa ad ee dd 02  21 00 ea 64 ea cc 89 09  |........!..d....|
++00000300  a4 fe 3c dc 6e 24 b6 ff  40 0b 11 37 16 5b ef e1  |..<.n$..@..7.[..|
++00000310  8d 2c c1 4a ac fe 78 c0  c8 db 16 03 03 00 2c 0d  |.,.J..x.......,.|
++00000320  00 00 28 01 40 00 08 04  03 08 07 05 03 06 03 00  |..(.@...........|
++00000330  1a 00 18 30 16 31 14 30  12 06 03 55 04 03 13 0b  |...0.1.0...U....|
++00000340  43 6c 69 65 6e 74 20 52  6f 6f 74 16 03 03 00 04  |Client Root.....|
++00000350  0e 00 00 00                                       |....|
  >>> Flow 3 (client to server)
  00000000  16 03 03 02 38 0b 00 02  34 00 02 31 00 02 2e 30  |....8...4..1...0|
  00000010  82 02 2a 30 82 01 12 a0  03 02 01 02 02 01 0e 30  |..*0...........0|
@@ -302,16 +372,16 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519
 -000002b0  ad b9 2f 0d 14 03 03 00  01 01 16 03 03 00 20 5c  |../........... \|
 -000002c0  10 72 6b 41 77 23 bb 2b  73 4a 53 f9 85 15 3f bf  |.rkAw#.+sJS...?.|
 -000002d0  c3 51 e4 25 c3 5a 99 af  93 c1 bc d4 a2 24 ac     |.Q.%.Z.......$.|
-+00000240  00 25 10 00 00 21 20 49  ae d5 26 99 54 48 22 03  |.%...! I..&.TH".|
-+00000250  07 51 e9 75 04 ec 37 59  97 11 08 f0 00 49 f0 8f  |.Q.u..7Y.....I..|
-+00000260  c8 ee cc 07 c3 14 6f 16  03 03 00 48 0f 00 00 44  |......o....H...D|
-+00000270  08 07 00 40 42 4d 94 75  46 9d 76 e5 f8 62 62 6e  |...@BM.uF.v..bbn|
-+00000280  93 5e 5f 37 44 9c 4e 31  16 d3 87 a6 e0 97 4d 73  |.^_7D.N1......Ms|
-+00000290  77 ea 6d bb a4 29 d4 1b  07 ed c2 1a 21 82 44 6f  |w.m..)......!.Do|
-+000002a0  5b fa a1 96 4e 43 7d 88  d3 9d 49 65 0b bc 55 c0  |[...NC}...Ie..U.|
-+000002b0  4d e0 4d 03 14 03 03 00  01 01 16 03 03 00 20 2f  |M.M........... /|
-+000002c0  24 81 6b 35 6d a2 0e 47  39 49 ab ed d2 86 07 3d  |$.k5m..G9I.....=|
-+000002d0  d3 48 22 69 d5 76 e4 a2  f8 82 97 a5 36 ed 61     |.H"i.v......6.a|
++00000240  00 25 10 00 00 21 20 15  fe 79 1a 72 d9 83 28 e8  |.%...! ..y.r..(.|
++00000250  0c e6 e7 d3 59 ce 4e cf  9c 6b c5 ea fc a4 7e 56  |....Y.N..k....~V|
++00000260  20 53 81 ae 58 58 7f 16  03 03 00 48 0f 00 00 44  | S..XX.....H...D|
++00000270  08 07 00 40 b7 d5 da 50  5c d4 68 02 4e 24 17 ab  |...@...P\.h.N$..|
++00000280  21 66 0d 88 64 f8 1f f2  8c 55 6f 43 7a 49 e6 d4  |!f..d....UoCzI..|
++00000290  8c d1 10 f9 cc 35 ba bf  21 18 3a b8 64 85 00 14  |.....5..!.:.d...|
++000002a0  93 f7 86 95 4d de 6d d6  df 06 57 49 96 19 cc 4e  |....M.m...WI...N|
++000002b0  7d 87 a1 01 14 03 03 00  01 01 16 03 03 00 20 12  |}............. .|
++000002c0  9a 60 36 c5 e3 85 21 9d  04 17 47 ee a7 cf 94 b2  |.`6...!...G.....|
++000002d0  8a 3d e1 fc af c8 02 9d  57 32 74 82 b1 f9 30     |.=......W2t...0|
  >>> Flow 4 (server to client)
 -00000000  14 03 03 00 01 01 16 03  03 00 20 80 ea 96 5c 70  |.......... ...\p|
 -00000010  a1 c6 3d 12 3a 9e 53 74  2b d3 f0 8b 75 f4 fe 3a  |..=.:.St+...u..:|
@@ -320,13 +390,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndEd25519
 -00000040  b3 03 54 ce 76 ec a8 9d  32 f4 40 ee 74 15 03 03  |..T.v...2.@.t...|
 -00000050  00 12 34 73 94 89 e2 ae  cf a6 4a cf 95 11 cd 33  |..4s......J....3|
 -00000060  a4 4e 66 db                                       |.Nf.|
-+00000000  14 03 03 00 01 01 16 03  03 00 20 80 db 3c f7 7c  |.......... ..<.||
-+00000010  f7 e9 9b 67 8f f8 64 cd  17 80 36 cf 3e 41 78 b3  |...g..d...6.>Ax.|
-+00000020  34 42 68 75 39 7c 4f 89  34 6d d1 17 03 03 00 1d  |4Bhu9|O.4m......|
-+00000030  f1 b8 7e 8a 3f 4d d2 6e  4a 48 f3 8b 07 c1 66 60  |..~.?M.nJH....f`|
-+00000040  f2 f3 c0 4b 91 b4 74 ae  3a 21 b3 4a ee 15 03 03  |...K..t.:!.J....|
-+00000050  00 12 12 01 c3 bd ed 42  d0 6c dc d4 34 3c ab e6  |.......B.l..4<..|
-+00000060  14 16 f4 9c                                       |....|
++00000000  14 03 03 00 01 01 16 03  03 00 20 39 71 22 6a 18  |.......... 9q"j.|
++00000010  64 d7 ff 59 af 5e 13 fd  d1 13 32 b8 b3 14 3d 83  |d..Y.^....2...=.|
++00000020  ab cc c8 66 b6 4c e8 b7  8d c6 39 17 03 03 00 1d  |...f.L....9.....|
++00000030  07 03 8e 18 af 1c 48 e9  c5 d4 33 f1 4b 23 f5 6a  |......H...3.K#.j|
++00000040  66 d5 db 7d e6 ad 3e 25  85 85 9d de 24 15 03 03  |f..}..>%....$...|
++00000050  00 12 8b eb 0d 1c 07 58  ae b9 38 8f 9e 41 b6 7e  |.......X..8..A.~|
++00000060  51 12 34 1f                                       |Q.4.|
 diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven
 --- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven
 +++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven
@@ -335,13 +405,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven b
 -00000000  16 03 01 00 d5 01 00 00  d1 03 03 80 7b d1 f7 ac  |............{...|
 -00000010  3d b0 45 32 ed 33 88 d7  6f 4c 50 aa 84 18 4f 91  |=.E2.3..oLP...O.|
 -00000020  ae ec 58 f9 2d 0d c5 0d  59 ac 82 00 00 38 c0 2c  |..X.-...Y....8.,|
-+00000000  16 03 01 00 d5 01 00 00  d1 03 03 18 d2 a3 4b 26  |..............K&|
-+00000010  49 b5 e0 cf 64 34 0b ad  06 1e c5 f0 4a ac 44 fd  |I...d4......J.D.|
-+00000020  35 3c b8 0c 50 75 69 ff  c0 7d b6 00 00 38 c0 2c  |5<..Pui..}...8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 2e 27 a6 71 ce  |............'.q.|
++00000010  8f ac 62 43 ee 4c 95 11  29 b0 3f 36 21 3c c8 3e  |..bC.L..).?6!<.>|
++00000020  a1 98 e3 47 10 82 18 79  0d d1 d6 00 00 38 c0 2c  |...G...y.....8.,|
  00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
  00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
  00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
-@@ -16,58 +16,83 @@
+@@ -16,58 +16,82 @@
  >>> Flow 2 (server to client)
  00000000  16 03 03 00 3f 02 00 00  3b 03 03 2c 84 0e c3 c0  |....?...;..,....|
  00000010  fd 58 12 43 ce a3 e8 28  a1 5c 70 ce 9a 7f 3b 59  |.X.C...(.\p...;Y|
@@ -448,32 +518,31 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven b
 +00000360  8c 93 03 6e 91 c1 1d e8  67 13 16 03 03 01 2c 0c  |...n....g.....,.|
 +00000370  00 01 28 03 00 1d 20 bb  af fa db e3 de 3a 65 10  |..(... ......:e.|
 +00000380  e8 9b 4b be c7 04 31 92  72 a2 39 97 24 0b 71 bb  |..K...1.r.9.$.q.|
-+00000390  86 4f f4 cb 98 39 57 08  04 01 00 42 8f f4 00 7a  |.O...9W....B...z|
-+000003a0  57 1f b4 94 af 08 08 48  fc 8c cf 39 d2 4f 7d 24  |W......H...9.O}$|
-+000003b0  5a 04 f2 bf c4 0d 8f 6a  82 9b 69 aa 41 9c 35 4c  |Z......j..i.A.5L|
-+000003c0  5a 60 17 6b 64 09 62 46  0f df 9e 68 6d 25 1d f0  |Z`.kd.bF...hm%..|
-+000003d0  ad fa 7b 9d b8 91 84 79  f7 af f6 a1 5e c1 84 ca  |..{....y....^...|
-+000003e0  ba 9e 4d 77 ec 26 3a 52  cb 98 50 81 b1 b4 aa 48  |..Mw.&:R..P....H|
-+000003f0  19 1f 69 44 bd 35 f7 95  43 f1 2c 41 5a 1b 58 ad  |..iD.5..C.,AZ.X.|
-+00000400  66 63 8e 11 87 27 57 65  ae 07 08 33 bf e3 2c 99  |fc...'We...3..,.|
-+00000410  e6 a9 df a4 42 59 d9 3e  cb 82 2f e5 dc 2e 9b 14  |....BY.>../.....|
-+00000420  08 a4 0f 7e 7f b3 c9 75  03 dc 32 0c 0c 96 5c 21  |...~...u..2...\!|
-+00000430  1d af 69 b4 a1 ba 0f 79  db 09 42 ee ca b8 ed d6  |..i....y..B.....|
-+00000440  19 9d 06 9e 29 8a dc b1  d4 49 58 82 53 0c 6f 8a  |....)....IX.S.o.|
-+00000450  3b a2 fe 21 9a d4 d5 e0  67 84 dd 87 ea 1a 11 03  |;..!....g.......|
-+00000460  89 cf 45 37 4d 74 ab 8b  68 18 95 58 44 eb 56 5d  |..E7Mt..h..XD.V]|
-+00000470  bf b9 58 5a 06 94 47 85  62 11 cd 65 1e e0 7c 94  |..XZ..G.b..e..|.|
-+00000480  d2 cd 3c a6 f0 01 10 37  41 2f cb 30 b5 ca 22 43  |..<....7A/.0.."C|
-+00000490  0b b8 18 7a eb 34 44 0c  31 7c de 16 03 03 00 38  |...z.4D.1|.....8|
-+000004a0  0d 00 00 34 01 01 00 14  08 04 04 03 08 07 08 05  |...4............|
-+000004b0  08 06 04 01 05 01 06 01  05 03 06 03 00 1a 00 18  |................|
-+000004c0  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
-+000004d0  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
-+000004e0  00                                                |.|
++00000390  86 4f f4 cb 98 39 57 08  04 01 00 e5 dd c7 90 92  |.O...9W.........|
++000003a0  a5 66 57 0a dc 47 2d c4  4d e3 3a 8c b1 89 cf 41  |.fW..G-.M.:....A|
++000003b0  80 fc 92 58 b2 c2 4f 1b  ed 34 47 ed 5e 6b b5 a5  |...X..O..4G.^k..|
++000003c0  b6 55 a8 2a 1b e2 ae 17  71 fd 1a be a1 35 25 48  |.U.*....q....5%H|
++000003d0  ba 5b 79 95 f0 fc 18 05  00 0e d3 5e b4 e9 d9 6a  |.[y........^...j|
++000003e0  8e 1c 24 72 7d a7 a1 9d  d7 53 19 a7 55 ad 47 13  |..$r}....S..U.G.|
++000003f0  5f 62 88 69 42 b0 01 73  15 7c 63 26 ac cc 91 21  |_b.iB..s.|c&...!|
++00000400  8c 4d 55 c1 52 85 b7 64  eb 68 db c3 12 18 bf e9  |.MU.R..d.h......|
++00000410  be cd 12 35 57 bb 47 e7  61 a6 a7 98 73 50 50 b3  |...5W.G.a...sPP.|
++00000420  21 16 5e 33 1c fb d8 87  eb 8e 5f 05 ca f2 92 c1  |!.^3......_.....|
++00000430  00 18 1a ae 71 f4 53 8e  bc 85 83 7d e8 1c e4 f9  |....q.S....}....|
++00000440  b5 8f 5f 0b b7 79 00 bb  85 50 18 48 4f 7d 15 0e  |.._..y...P.HO}..|
++00000450  1c bc cd ff 42 54 32 93  b8 bb e5 5d 03 27 f0 49  |....BT2....].'.I|
++00000460  6b e4 f0 38 1d c9 6d cc  65 bd af 64 85 29 15 62  |k..8..m.e..d.).b|
++00000470  56 32 2f ee a4 f1 7f 39  16 33 b5 cc 9b d4 f7 89  |V2/....9.3......|
++00000480  49 93 82 69 22 7b 8c 41  da e3 09 49 75 7c 80 88  |I..i"{.A...Iu|..|
++00000490  3c e0 16 37 0e 25 70 62  fa c3 03 16 03 03 00 30  |<..7.%pb.......0|
++000004a0  0d 00 00 2c 01 01 00 0c  08 04 08 05 08 06 04 01  |...,............|
++000004b0  05 01 06 01 00 1a 00 18  30 16 31 14 30 12 06 03  |........0.1.0...|
++000004c0  55 04 03 13 0b 43 6c 69  65 6e 74 20 52 6f 6f 74  |U....Client Root|
++000004d0  16 03 03 00 04 0e 00 00  00                       |.........|
  >>> Flow 3 (client to server)
  00000000  16 03 03 03 33 0b 00 03  2f 00 03 2c 00 03 29 30  |....3.../..,..)0|
  00000010  82 03 25 30 82 02 0d a0  03 02 01 02 02 01 0c 30  |..%0...........0|
-@@ -121,33 +146,33 @@
+@@ -121,33 +145,33 @@
  00000310  d1 29 4b 73 e6 ee cf ae  30 c2 01 89 d6 d5 b1 ce  |.)Ks....0.......|
  00000320  f2 80 9f 7e 6b 2e 8b ef  ee c1 37 59 c5 8f e6 ec  |...~k.....7Y....|
  00000330  7f f9 3a c9 3f 18 71 39  16 03 03 00 25 10 00 00  |..:.?.q9....%...|
@@ -499,28 +568,28 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven b
 -00000470  03 03 00 01 01 16 03 03  00 20 9e 2c 59 db a5 67  |......... .,Y..g|
 -00000480  94 3f 73 7d 08 39 25 2b  52 97 70 33 9f 75 d6 49  |.?s}.9%+R.p3.u.I|
 -00000490  b0 c3 78 76 1a 95 d4 5b  8c 82                    |..xv...[..|
-+00000340  21 20 a8 ba 12 01 3a 18  d6 3a 48 36 75 4a 39 43  |! ....:..:H6uJ9C|
-+00000350  a6 a0 44 de 97 68 e4 ef  9a d6 36 99 36 af d2 6d  |..D..h....6.6..m|
-+00000360  f9 1b 16 03 03 01 08 0f  00 01 04 08 04 01 00 39  |...............9|
-+00000370  ba 0e 68 18 6c 80 2b 0c  26 ba e6 7b aa 5b 33 ef  |..h.l.+.&..{.[3.|
-+00000380  47 26 8b f1 90 73 42 f6  ac bf f4 3d 01 67 a7 a4  |G&...sB....=.g..|
-+00000390  c6 46 fe f1 bc 69 03 a3  86 f8 88 72 9e 0e d7 b4  |.F...i.....r....|
-+000003a0  7a 03 6b 47 cb 70 dd 59  4c c6 d5 29 0d 27 55 43  |z.kG.p.YL..).'UC|
-+000003b0  1c 1f 03 77 f4 ae df 45  a2 8d e3 4f b6 b2 0d 47  |...w...E...O...G|
-+000003c0  8a c7 0c aa ad f0 ab cf  d8 ab 27 77 6f 33 44 6d  |..........'wo3Dm|
-+000003d0  a8 b1 62 6d 02 17 e3 5e  05 85 95 37 cb ec c8 38  |..bm...^...7...8|
-+000003e0  3c d5 d6 81 6c cf d2 f9  24 69 49 f9 73 1a 2b 49  |<...l...$iI.s.+I|
-+000003f0  fe 74 81 01 fa 0c 78 b9  36 4b f8 e6 a6 35 19 ac  |.t....x.6K...5..|
-+00000400  ee 1b 8f 5d 5d b8 b1 61  47 9f fb 21 80 ef ad 06  |...]]..aG..!....|
-+00000410  76 36 5d 00 d0 87 aa 0d  14 d3 d2 8d ea 1f 2e 65  |v6]............e|
-+00000420  e9 a0 9f fa a9 a0 2e f2  c2 4b 14 6f 37 fe e4 01  |.........K.o7...|
-+00000430  db 25 46 c3 5f 04 95 ff  45 84 bf 00 d5 f0 e5 45  |.%F._...E......E|
-+00000440  30 10 41 bc fd 55 f9 34  eb 74 6c 48 8d 59 32 59  |0.A..U.4.tlH.Y2Y|
-+00000450  1f 7e f2 eb 9b aa 1f 85  a1 a2 e8 18 9f 5b 6e 60  |.~...........[n`|
-+00000460  7e 33 75 45 70 50 36 a6  3f 37 04 c3 30 21 fc 14  |~3uEpP6.?7..0!..|
-+00000470  03 03 00 01 01 16 03 03  00 20 c9 8c d8 b8 30 2c  |......... ....0,|
-+00000480  5d 4e c3 1e 3d 64 f4 f8  84 41 e5 f6 c5 df b9 a4  |]N..=d...A......|
-+00000490  db 34 11 d6 81 98 76 9f  c1 c6                    |.4....v...|
++00000340  21 20 fc e7 65 45 10 f0  8e 3b 35 36 5f 7a c2 81  |! ..eE...;56_z..|
++00000350  ae c2 05 d5 aa db 0e 40  78 4d ba 10 49 1f 1b ac  |.......@xM..I...|
++00000360  52 07 16 03 03 01 08 0f  00 01 04 08 04 01 00 0d  |R...............|
++00000370  02 a4 7b f4 8e a9 f2 b4  49 f6 18 83 c8 0f 4a 17  |..{.....I.....J.|
++00000380  14 0d e1 37 74 25 e6 79  41 d2 7d 2d 3c 67 97 45  |...7t%.yA.}-<g.E|
++00000390  bf f1 5c 7f 22 0c 5c 43  fc 38 13 de 46 d0 a1 cd  |..\.".\C.8..F...|
++000003a0  25 a2 66 7a 3e 22 d5 94  b0 31 d4 cc e3 80 f2 83  |%.fz>"...1......|
++000003b0  68 19 03 d2 ce 92 02 1f  fc 9b 5e 2e 1c 66 9c b5  |h.........^..f..|
++000003c0  ac ed c2 bf b8 4d d9 94  ec 21 95 0e e7 a1 b0 8b  |.....M...!......|
++000003d0  57 ea b2 d0 be 8c 18 ea  ee 83 38 df 21 25 73 ab  |W.........8.!%s.|
++000003e0  7f a8 1d 51 69 ca db c9  6b c0 cf 99 41 ec 04 3f  |...Qi...k...A..?|
++000003f0  5d 17 8c 44 04 dd 1d 5b  20 96 17 87 0d 46 5b a1  |]..D...[ ....F[.|
++00000400  fa 1c 66 10 91 49 35 69  83 14 ab 80 45 16 13 50  |..f..I5i....E..P|
++00000410  e3 ee 08 05 00 6c e4 f6  78 6c e9 9d 18 5f cc d8  |.....l..xl..._..|
++00000420  52 cb 7d f2 ee 0a 6e 6b  a5 65 bd 4c 16 46 4e 10  |R.}...nk.e.L.FN.|
++00000430  6f 22 60 9f 64 9f d5 68  7d b3 cc 37 8a fd e3 23  |o"`.d..h}..7...#|
++00000440  3a fa 94 6d b0 a3 ee 02  c7 55 58 04 64 0e 9d 0f  |:..m.....UX.d...|
++00000450  a4 db 82 9d bd c4 94 c3  43 a3 d4 aa 82 78 87 a4  |........C....x..|
++00000460  0b b6 7d 04 7e 7e f9 dc  99 f4 4c b9 22 dc 7b 14  |..}.~~....L.".{.|
++00000470  03 03 00 01 01 16 03 03  00 20 b6 9b 22 b3 b1 94  |......... .."...|
++00000480  c3 88 28 68 55 13 98 7b  ff 9a f1 92 49 46 e7 ac  |..(hU..{....IF..|
++00000490  72 8e 43 49 7b 07 f9 f1  f8 66                    |r.CI{....f|
  >>> Flow 4 (server to client)
 -00000000  14 03 03 00 01 01 16 03  03 00 20 3f d7 05 3a 5b  |.......... ?..:[|
 -00000010  69 42 97 4d 8c 95 9e 3e  27 e3 66 8d 92 f5 60 69  |iB.M...>'.f...`i|
@@ -529,13 +598,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndGiven b
 -00000040  a0 a4 fb 19 03 13 f3 b8  a3 19 5d 2f 66 15 03 03  |..........]/f...|
 -00000050  00 12 e7 f4 d7 06 f9 e0  aa 8c 72 64 8d 27 a4 1d  |..........rd.'..|
 -00000060  97 5e d9 e8                                       |.^..|
-+00000000  14 03 03 00 01 01 16 03  03 00 20 95 6b 40 da 1d  |.......... .k@..|
-+00000010  ac ea b8 5d 84 49 35 9f  e3 f4 a2 d7 13 e6 8b 51  |...].I5........Q|
-+00000020  f5 c9 0c 58 8f c6 0b 7d  7d 9d f1 17 03 03 00 1d  |...X...}}.......|
-+00000030  f5 b6 a7 6f 8f cf c6 dd  18 f3 32 1d 69 8c 10 62  |...o......2.i..b|
-+00000040  ca 8e af 51 9f f6 c7 9d  2e 3c 0c a6 8d 15 03 03  |...Q.....<......|
-+00000050  00 12 30 90 e9 eb 77 a7  e3 c1 c3 1b 47 f3 03 33  |..0...w.....G..3|
-+00000060  f0 97 35 b3                                       |..5.|
++00000000  14 03 03 00 01 01 16 03  03 00 20 9a a0 9c d1 60  |.......... ....`|
++00000010  23 e3 89 e7 ce 08 b4 95  53 8c 91 d7 c3 ff cb 37  |#.......S......7|
++00000020  4f 53 06 3c 75 89 d5 4d  48 6b 17 17 03 03 00 1d  |OS.<u..MHk......|
++00000030  d2 ea 7a 18 83 ab e0 0d  f0 1a ee 4c 7f 3d 98 3f  |..z........L.=.?|
++00000040  68 51 50 c5 94 0b 31 77  4a 5d 99 46 fd 15 03 03  |hQP...1wJ].F....|
++00000050  00 12 8b 26 c1 23 45 f7  ed 70 f0 85 25 49 64 57  |...&.#E..p..%IdW|
++00000060  71 a8 80 b1                                       |q...|
 diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given
 --- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given
 +++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v15Given
@@ -544,13 +613,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v1
 -00000000  16 03 01 00 d5 01 00 00  d1 03 03 92 ca c8 a7 98  |................|
 -00000010  c9 3b 29 e5 1e 72 e6 92  42 e0 3b 9f 5a 65 73 09  |.;)..r..B.;.Zes.|
 -00000020  08 1c 53 d2 d0 62 48 4e  d8 a6 89 00 00 38 c0 2c  |..S..bHN.....8.,|
-+00000000  16 03 01 00 d5 01 00 00  d1 03 03 49 49 7b b2 80  |...........II{..|
-+00000010  a3 88 28 5c 4d c7 07 07  14 95 b7 ba 65 b0 ca 8f  |..(\M.......e...|
-+00000020  8a f6 2c 23 01 b6 bf f2  f1 f4 bf 00 00 38 c0 2c  |..,#.........8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 38 ce d7 c6 b5  |...........8....|
++00000010  0c 16 4f 39 67 ce b0 f5  e8 5d 26 e2 16 55 53 a6  |..O9g....]&..US.|
++00000020  db 97 4f 48 25 f2 8c a0  c6 ab 09 00 00 38 c0 2c  |..OH%........8.,|
  00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
  00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
  00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
-@@ -16,59 +16,83 @@
+@@ -16,59 +16,82 @@
  >>> Flow 2 (server to client)
  00000000  16 03 03 00 3f 02 00 00  3b 03 03 2c 84 0e c3 c0  |....?...;..,....|
  00000010  fd 58 12 43 ce a3 e8 28  a1 5c 70 ce 9a 7f 3b 59  |.X.C...(.\p...;Y|
@@ -658,32 +727,31 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v1
 +00000360  8c 93 03 6e 91 c1 1d e8  67 13 16 03 03 01 2c 0c  |...n....g.....,.|
 +00000370  00 01 28 03 00 1d 20 bb  af fa db e3 de 3a 65 10  |..(... ......:e.|
 +00000380  e8 9b 4b be c7 04 31 92  72 a2 39 97 24 0b 71 bb  |..K...1.r.9.$.q.|
-+00000390  86 4f f4 cb 98 39 57 08  04 01 00 8a cf 48 05 47  |.O...9W......H.G|
-+000003a0  79 b1 02 f6 51 36 56 3b  13 1c 60 dc 14 40 d3 c6  |y...Q6V;..`..@..|
-+000003b0  25 d4 63 38 95 af 2a 7a  d7 33 ca 23 53 58 86 d1  |%.c8..*z.3.#SX..|
-+000003c0  7d 28 05 7e c8 23 73 6d  33 c8 4d 25 6e 10 db 5c  |}(.~.#sm3.M%n..\|
-+000003d0  ae 51 40 44 fd 4b da 3c  de 82 2b b2 e7 c3 40 44  |.Q@D.K.<..+...@D|
-+000003e0  82 64 ba bf 4d 09 0a 5c  32 f7 85 01 3a 8b a5 96  |.d..M..\2...:...|
-+000003f0  34 da 34 89 b0 31 21 11  fd 0d 7b 1f eb 7f e3 3c  |4.4..1!...{....<|
-+00000400  ac 7d f5 ed 9c c4 f3 c0  d5 57 dc 7c 15 5f 78 43  |.}.......W.|._xC|
-+00000410  dd 04 9c 61 a3 8c b9 4e  d9 49 6f b8 8f c7 18 29  |...a...N.Io....)|
-+00000420  d6 8f 29 73 1f b9 79 1c  29 34 9c 75 88 2b 8a ea  |..)s..y.)4.u.+..|
-+00000430  b3 b1 58 0d a5 94 3f f7  ed 89 0f 17 80 81 82 d4  |..X...?.........|
-+00000440  b5 e2 f4 dd 15 a2 ee 47  66 0f 8c 14 63 99 89 bf  |.......Gf...c...|
-+00000450  da 85 cf 68 88 45 ff 83  fc 46 3b de ee f5 79 2c  |...h.E...F;...y,|
-+00000460  17 af 72 1d 0a 57 48 5b  53 95 c0 23 75 fd bc de  |..r..WH[S..#u...|
-+00000470  6f ce bf 98 a8 9b 61 8a  7e 5d f6 ab aa f2 2a cd  |o.....a.~]....*.|
-+00000480  ea df 45 3a e7 fa 19 c7  0c cb 51 7c 3c d3 8f 35  |..E:......Q|<..5|
-+00000490  a6 a0 ef 31 9c 6b 57 95  a3 1c 26 16 03 03 00 38  |...1.kW...&....8|
-+000004a0  0d 00 00 34 01 01 00 14  08 04 04 03 08 07 08 05  |...4............|
-+000004b0  08 06 04 01 05 01 06 01  05 03 06 03 00 1a 00 18  |................|
-+000004c0  30 16 31 14 30 12 06 03  55 04 03 13 0b 43 6c 69  |0.1.0...U....Cli|
-+000004d0  65 6e 74 20 52 6f 6f 74  16 03 03 00 04 0e 00 00  |ent Root........|
-+000004e0  00                                                |.|
++00000390  86 4f f4 cb 98 39 57 08  04 01 00 3c 9d 5a 02 a2  |.O...9W....<.Z..|
++000003a0  44 4f 1c 36 70 6c 52 ba  4a 2d 7a 12 e1 3f 19 43  |DO.6plR.J-z..?.C|
++000003b0  f4 3a 5b da 03 db 7a 47  3a 23 09 d8 b1 22 c3 bb  |.:[...zG:#..."..|
++000003c0  3b 4e a5 a1 ac ab e4 38  18 fa 11 6d b5 8e f0 65  |;N.....8...m...e|
++000003d0  1a c5 ff 79 bf df b9 7a  28 96 88 b6 4d 0d 4b 3f  |...y...z(...M.K?|
++000003e0  5f 86 9c 4f 11 70 8f 6a  55 87 64 21 1d 55 99 f0  |_..O.p.jU.d!.U..|
++000003f0  06 31 54 5e c2 dc e6 6b  5d 2a 5e e6 b1 9a 0a bf  |.1T^...k]*^.....|
++00000400  ec bd 31 5f f1 a0 fb 32  2c df bf 70 e6 9c bc cd  |..1_...2,..p....|
++00000410  50 bc dd ce f6 a1 9b 7e  70 49 a9 c6 3d 20 5d 91  |P......~pI..= ].|
++00000420  01 07 41 4e 09 3f 78 2f  4f f1 17 d2 4c 4c 6a 28  |..AN.?x/O...LLj(|
++00000430  64 a5 83 af 5b 56 60 ab  79 09 c7 56 a6 9e 7b cb  |d...[V`.y..V..{.|
++00000440  8a ad b7 e3 fc 73 9b d4  c1 dd 2e d9 e8 70 90 b9  |.....s.......p..|
++00000450  fd aa 5c 9d 44 f1 0e 1a  f6 08 cf 82 e4 92 48 aa  |..\.D.........H.|
++00000460  96 ef b4 63 43 03 26 9d  8c 09 59 8f 71 e2 39 2b  |...cC.&...Y.q.9+|
++00000470  74 e6 09 1b 65 3d 62 e4  d0 10 11 48 bd 86 17 87  |t...e=b....H....|
++00000480  4d e0 06 4a 27 be f4 84  80 4d c4 ce 05 0d d7 7a  |M..J'....M.....z|
++00000490  8e 19 3d ff 0b 98 d0 3b  0f 94 40 16 03 03 00 30  |..=....;..@....0|
++000004a0  0d 00 00 2c 01 01 00 0c  08 04 08 05 08 06 04 01  |...,............|
++000004b0  05 01 06 01 00 1a 00 18  30 16 31 14 30 12 06 03  |........0.1.0...|
++000004c0  55 04 03 13 0b 43 6c 69  65 6e 74 20 52 6f 6f 74  |U....Client Root|
++000004d0  16 03 03 00 04 0e 00 00  00                       |.........|
  >>> Flow 3 (client to server)
  00000000  16 03 03 03 33 0b 00 03  2f 00 03 2c 00 03 29 30  |....3.../..,..)0|
  00000010  82 03 25 30 82 02 0d a0  03 02 01 02 02 01 0c 30  |..%0...........0|
-@@ -122,33 +146,33 @@
+@@ -122,33 +145,33 @@
  00000310  d1 29 4b 73 e6 ee cf ae  30 c2 01 89 d6 d5 b1 ce  |.)Ks....0.......|
  00000320  f2 80 9f 7e 6b 2e 8b ef  ee c1 37 59 c5 8f e6 ec  |...~k.....7Y....|
  00000330  7f f9 3a c9 3f 18 71 39  16 03 03 00 25 10 00 00  |..:.?.q9....%...|
@@ -709,28 +777,28 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v1
 -00000470  03 03 00 01 01 16 03 03  00 20 a8 10 35 03 41 09  |......... ..5.A.|
 -00000480  23 ef a4 63 28 ed f6 48  a9 73 c8 46 2b c9 41 9f  |#..c(..H.s.F+.A.|
 -00000490  87 46 70 05 95 d4 c3 a3  90 d2                    |.Fp.......|
-+00000340  21 20 88 15 c1 c6 98 fc  46 e8 cf 53 7f 71 f9 5d  |! ......F..S.q.]|
-+00000350  e9 49 b2 44 89 94 a4 c3  a7 26 01 a9 10 98 0a 7c  |.I.D.....&.....||
-+00000360  69 52 16 03 03 01 08 0f  00 01 04 04 01 01 00 96  |iR..............|
-+00000370  6b 61 06 99 bf 6e 50 bb  40 0a 0e 15 52 70 b2 42  |ka...nP.@...Rp.B|
-+00000380  62 43 af 97 52 8a 3c 8b  18 65 5c 33 d2 94 a0 45  |bC..R.<..e\3...E|
-+00000390  aa 34 4a 02 e6 97 b4 22  9c 7a ac 42 e7 bf 9d 8b  |.4J....".z.B....|
-+000003a0  e7 12 41 ab c6 a6 5f 16  12 de b4 e8 7a 16 d8 0e  |..A..._.....z...|
-+000003b0  75 ef 55 65 cf f2 15 8d  2e e5 69 87 22 d7 71 72  |u.Ue......i.".qr|
-+000003c0  db e4 26 71 26 bd 17 b9  62 a1 94 d5 9a a8 e7 75  |..&q&...b......u|
-+000003d0  58 fe 7c be 9d bc 3f 02  1d 7a d2 c1 97 9b 2c 84  |X.|...?..z....,.|
-+000003e0  c3 28 f8 bb 24 c6 7a d6  4b be 50 fe 84 8c 1b 86  |.(..$.z.K.P.....|
-+000003f0  56 c3 8d 2f 12 a3 56 4e  d0 fc b6 71 01 3e 1f 85  |V../..VN...q.>..|
-+00000400  8d 0f 36 4e 67 b2 ea bd  bb 74 db f7 3c 46 46 25  |..6Ng....t..<FF%|
-+00000410  5b e2 08 ce 91 3f c8 10  5d 47 ab ee 85 c5 0a 61  |[....?..]G.....a|
-+00000420  82 ac 54 ae b2 fb 24 a9  19 1b 2f 01 1d 55 4c 58  |..T...$.../..ULX|
-+00000430  94 4b 42 f3 5c d1 66 de  01 36 45 a6 27 1d 33 be  |.KB.\.f..6E.'.3.|
-+00000440  63 78 52 00 47 b2 56 44  ff 08 f0 96 3b 5f ca 3f  |cxR.G.VD....;_.?|
-+00000450  f5 ea 5e 60 41 f5 58 df  8e 12 07 7a 7c 7f 6d c2  |..^`A.X....z|.m.|
-+00000460  d0 49 b1 03 ff 92 46 76  e2 fb af 7a b1 d8 d0 14  |.I....Fv...z....|
-+00000470  03 03 00 01 01 16 03 03  00 20 59 b7 75 7c 0f 47  |......... Y.u|.G|
-+00000480  51 d9 2a 20 cd 33 0b 00  41 73 5a 0d dd d7 ed 51  |Q.* .3..AsZ....Q|
-+00000490  ea 41 18 3a fb b0 c2 f0  55 78                    |.A.:....Ux|
++00000340  21 20 ea 27 e2 93 22 7f  11 1b 21 32 4e 1c 21 dd  |! .'.."...!2N.!.|
++00000350  d8 7a 3b 88 94 1b 75 a9  fe 94 4e 81 3d b4 dd f7  |.z;...u...N.=...|
++00000360  69 62 16 03 03 01 08 0f  00 01 04 04 01 01 00 5c  |ib.............\|
++00000370  31 aa 68 f1 8b 01 63 9f  17 4b 69 77 a9 89 15 b9  |1.h...c..Kiw....|
++00000380  27 b8 58 55 ec 23 46 a0  c3 12 37 27 b8 50 04 c3  |'.XU.#F...7'.P..|
++00000390  fd 89 dd 72 d5 4f c3 06  a6 61 b9 fd d2 dd 02 40  |...r.O...a.....@|
++000003a0  41 1a 50 14 77 f4 e4 d8  85 62 dc 4b 7b 5e 49 fd  |A.P.w....b.K{^I.|
++000003b0  79 d5 5d b0 a7 f6 8c ab  a6 72 43 aa bc 9f 25 30  |y.]......rC...%0|
++000003c0  91 bd d5 9c ac a8 01 d9  b2 57 db 58 98 e5 93 60  |.........W.X...`|
++000003d0  b0 bf cb 14 96 6e 14 6f  86 7b e3 02 fe 43 65 7d  |.....n.o.{...Ce}|
++000003e0  84 ca f4 1a 90 9b fb 93  88 dd 55 1e 7e 67 92 f7  |..........U.~g..|
++000003f0  fa 5a 84 e3 2b 07 41 0b  62 c5 03 87 8e 71 e7 d7  |.Z..+.A.b....q..|
++00000400  d6 80 3c 70 a8 bf fb 2d  a2 c6 62 90 9b 0f fa 97  |..<p...-..b.....|
++00000410  b5 f7 5c 25 e4 7c 7b 87  6d d9 df 81 c9 6a 96 17  |..\%.|{.m....j..|
++00000420  29 d1 fe 95 2e d3 64 33  7f a2 69 ec e8 36 82 77  |).....d3..i..6.w|
++00000430  46 a2 c8 8b ee 40 41 a3  bc ec 0f 55 27 fd 67 2d  |F....@A....U'.g-|
++00000440  1f 5a 75 80 70 99 c8 7e  7d 2b df 8f e8 b7 7b 40  |.Zu.p..~}+....{@|
++00000450  58 ab 3e c0 3d f3 8d a3  af b5 fe b5 58 99 d7 7d  |X.>.=.......X..}|
++00000460  9f f7 cb bb af 2b 36 c5  e2 d5 47 d9 27 dc fd 14  |.....+6...G.'...|
++00000470  03 03 00 01 01 16 03 03  00 20 6c b1 1c 6f a7 92  |......... l..o..|
++00000480  39 ba 47 69 40 d4 10 f5  3f ec c6 70 ea 22 11 bd  |9.Gi@...?..p."..|
++00000490  b4 1d 83 47 8a 50 da 7a  b5 e3                    |...G.P.z..|
  >>> Flow 4 (server to client)
 -00000000  14 03 03 00 01 01 16 03  03 00 20 eb e4 5a 0f f2  |.......... ..Z..|
 -00000010  60 59 99 71 9a 30 03 8f  fb 8d 5a e7 de d2 17 bc  |`Y.q.0....Z.....|
@@ -739,13 +807,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedAndPKCS1v1
 -00000040  ee 38 2e f0 54 37 80 18  c7 f3 42 63 bd 15 03 03  |.8..T7....Bc....|
 -00000050  00 12 1b 1e d4 ea 0d 65  2f 0e 65 99 5c 76 a5 94  |.......e/.e.\v..|
 -00000060  82 91 cd d5                                       |....|
-+00000000  14 03 03 00 01 01 16 03  03 00 20 f0 61 29 4d 72  |.......... .a)Mr|
-+00000010  c7 29 92 48 e5 cc a7 fc  3b d1 93 81 b6 7a 2f 52  |.).H....;....z/R|
-+00000020  f5 7f 8c 57 88 1d 73 77  49 f5 a7 17 03 03 00 1d  |...W..swI.......|
-+00000030  40 15 31 f6 b9 2f db 3d  2e 59 a3 39 66 82 6b 30  |@.1../.=.Y.9f.k0|
-+00000040  6b ab 32 72 6a 77 70 f6  50 a9 e9 6b 2b 15 03 03  |k.2rjwp.P..k+...|
-+00000050  00 12 de e2 af 25 79 bf  64 b3 7d 17 e7 c6 10 a3  |.....%y.d.}.....|
-+00000060  6f 4e aa 06                                       |oN..|
++00000000  14 03 03 00 01 01 16 03  03 00 20 f5 cd 85 52 57  |.......... ...RW|
++00000010  c6 99 c6 85 c8 49 bc d1  ba 18 ab 76 76 e9 71 fd  |.....I.....vv.q.|
++00000020  f8 74 4b 3a e1 89 1e 43  d1 42 2a 17 03 03 00 1d  |.tK:...C.B*.....|
++00000030  54 20 77 a8 30 51 41 92  d3 21 94 df 06 f3 32 bb  |T w.0QA..!....2.|
++00000040  89 8f 58 52 dc fb 21 6e  c4 fb 36 31 3b 15 03 03  |..XR..!n..61;...|
++00000050  00 12 36 62 42 e3 f6 74  55 7b 55 e5 61 7e 51 5d  |..6bB..tU{U.a~Q]|
++00000060  2e 69 b6 fa                                       |.i..|
 diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven
 --- a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven
 +++ b/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven
@@ -754,9 +822,9 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b
 -00000000  16 03 01 00 d5 01 00 00  d1 03 03 c5 ed 60 aa 56  |.............`.V|
 -00000010  36 52 e9 79 7e 79 c5 48  83 d3 79 e8 08 49 56 f6  |6R.y~y.H..y..IV.|
 -00000020  85 70 9d 9b be d6 60 49  6a c6 88 00 00 38 c0 2c  |.p....`Ij....8.,|
-+00000000  16 03 01 00 d5 01 00 00  d1 03 03 25 75 1d cd 9f  |...........%u...|
-+00000010  14 51 40 4a f1 9f 4b 5d  08 71 f5 63 c6 00 c5 78  |.Q@J..K].q.c...x|
-+00000020  1f 3c 06 fb 04 a2 ec b9  18 79 37 00 00 38 c0 2c  |.<.......y7..8.,|
++00000000  16 03 01 00 d5 01 00 00  d1 03 03 f5 fe 8d 8a 15  |................|
++00000010  aa 14 ae bd 84 f3 03 29  16 51 25 d7 a7 55 09 cf  |.......).Q%..U..|
++00000020  f4 2d c9 de 40 40 0a d3  eb c9 05 00 00 38 c0 2c  |.-..@@.......8.,|
  00000030  c0 30 00 9f cc a9 cc a8  cc aa c0 2b c0 2f 00 9e  |.0.........+./..|
  00000040  c0 24 c0 28 00 6b c0 23  c0 27 00 67 c0 0a c0 14  |.$.(.k.#.'.g....|
  00000050  00 39 c0 09 c0 13 00 33  00 9d 00 9c 00 3d 00 3c  |.9.....3.....=.<|
@@ -765,7 +833,7 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b
  00000280  11 6e d0 e0 77 47 77 f2  d7 9c 04 45 bb 82 eb 4e  |.n..wGw....E...N|
  00000290  f5 da 16 43 4d 45 c7 c7  e4 9b 08 2e d4 b4 6b 1f  |...CME........k.|
 -000002a0  df ed 16 03 03 00 74 0c  00 00 70 03 00 1d 20 bb  |......t...p... .|
-+000002a0  df ed 16 03 03 00 73 0c  00 00 6f 03 00 1d 20 bb  |......s...o... .|
++000002a0  df ed 16 03 03 00 72 0c  00 00 6e 03 00 1d 20 bb  |......r...n... .|
  000002b0  af fa db e3 de 3a 65 10  e8 9b 4b be c7 04 31 92  |.....:e...K...1.|
  000002c0  72 a2 39 97 24 0b 71 bb  86 4f f4 cb 98 39 57 04  |r.9.$.q..O...9W.|
 -000002d0  03 00 48 30 46 02 21 00  fc 41 ef c7 fb 7e 98 1f  |..H0F.!..A...~..|
@@ -778,15 +846,15 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b
 -00000340  18 30 16 31 14 30 12 06  03 55 04 03 13 0b 43 6c  |.0.1.0...U....Cl|
 -00000350  69 65 6e 74 20 52 6f 6f  74 16 03 03 00 04 0e 00  |ient Root.......|
 -00000360  00 00                                             |..|
-+000002d0  03 00 47 30 45 02 20 60  c5 bb a6 03 c0 28 bb e4  |..G0E. `.....(..|
-+000002e0  42 79 a5 96 7f 50 2a 97  87 fe 6a 31 e4 80 69 eb  |By...P*...j1..i.|
-+000002f0  6e 61 58 ee 6e 80 b8 02  21 00 c9 f9 91 05 bb 3e  |naX.n...!......>|
-+00000300  8b 7d 4b e0 df 43 1c d5  86 62 08 d8 f0 57 ea 7c  |.}K..C...b...W.||
-+00000310  e2 e7 42 93 a5 7c e9 91  d5 cd 16 03 03 00 38 0d  |..B..|........8.|
-+00000320  00 00 34 01 40 00 14 08  04 04 03 08 07 08 05 08  |..4.@...........|
-+00000330  06 04 01 05 01 06 01 05  03 06 03 00 1a 00 18 30  |...............0|
-+00000340  16 31 14 30 12 06 03 55  04 03 13 0b 43 6c 69 65  |.1.0...U....Clie|
-+00000350  6e 74 20 52 6f 6f 74 16  03 03 00 04 0e 00 00 00  |nt Root.........|
++000002d0  03 00 46 30 44 02 20 03  07 c6 01 36 26 8f e7 85  |..F0D. ....6&...|
++000002e0  1b 8f 95 e1 b9 09 99 c4  76 98 ea c9 18 da 71 5d  |........v.....q]|
++000002f0  b3 6f d5 60 88 63 e3 02  20 54 ff a1 bf 8e bd 57  |.o.`.c.. T.....W|
++00000300  65 bb 75 be 0a 1e c1 d1  78 16 56 4a ff 3c 39 68  |e.u.....x.VJ.<9h|
++00000310  a1 f6 58 a3 87 83 90 7e  96 16 03 03 00 2c 0d 00  |..X....~.....,..|
++00000320  00 28 01 40 00 08 04 03  08 07 05 03 06 03 00 1a  |.(.@............|
++00000330  00 18 30 16 31 14 30 12  06 03 55 04 03 13 0b 43  |..0.1.0...U....C|
++00000340  6c 69 65 6e 74 20 52 6f  6f 74 16 03 03 00 04 0e  |lient Root......|
++00000350  00 00 00                                          |...|
  >>> Flow 3 (client to server)
  00000000  16 03 03 00 07 0b 00 00  03 00 00 00 16 03 03 00  |................|
 -00000010  25 10 00 00 21 20 62 21  64 7c c3 89 77 18 33 c5  |%...! b!d|..w.3.|
@@ -795,12 +863,12 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b
 -00000040  20 c3 cf c2 39 0d 26 b3  0a a0 e2 e0 f8 3b ee cc  | ...9.&......;..|
 -00000050  aa e6 4c 56 52 a8 51 d7  32 1f fa ea 43 f2 75 b3  |..LVR.Q.2...C.u.|
 -00000060  ae                                                |.|
-+00000010  25 10 00 00 21 20 75 97  04 de 56 10 e6 3a e0 1c  |%...! u...V..:..|
-+00000020  e5 6e 83 7e c2 88 ac f3  f7 71 b0 ba 8d a6 12 f9  |.n.~.....q......|
-+00000030  6e 07 28 52 9b 0e 14 03  03 00 01 01 16 03 03 00  |n.(R............|
-+00000040  20 d3 19 82 41 06 4a e7  46 36 06 d9 c5 22 60 e9  | ...A.J.F6..."`.|
-+00000050  c5 70 aa 23 10 5b 1d c2  14 d9 a5 3f 22 9e 61 f5  |.p.#.[.....?".a.|
-+00000060  10                                                |.|
++00000010  25 10 00 00 21 20 6b 6b  f5 22 70 04 3b 03 eb 7f  |%...! kk."p.;...|
++00000020  00 e0 19 de 81 79 24 36  64 6b 5a cb 11 00 c3 f8  |.....y$6dkZ.....|
++00000030  0a 57 45 e3 a2 60 14 03  03 00 01 01 16 03 03 00  |.WE..`..........|
++00000040  20 aa df 3c ee b2 e8 b1  59 74 67 75 e8 c9 17 40  | ..<....Ytgu...@|
++00000050  d2 7b d7 75 ec d5 e5 a1  d2 ee 88 1b d0 a0 b8 0f  |.{.u............|
++00000060  58                                                |X|
  >>> Flow 4 (server to client)
 -00000000  14 03 03 00 01 01 16 03  03 00 20 62 ee 6c 64 56  |.......... b.ldV|
 -00000010  72 0b 14 26 21 06 30 16  9c 9c 33 89 26 f9 cf b1  |r..&!.0...3.&...|
@@ -809,13 +877,13 @@ diff --git a/src/crypto/tls/testdata/Server-TLSv12-ClientAuthRequestedNotGiven b
 -00000040  1a 1c 3b c9 ac 1f d5 ab  c3 b7 c2 ef 80 15 03 03  |..;.............|
 -00000050  00 12 bb 33 94 49 94 6c  5d b4 2c d9 f7 ed ee 57  |...3.I.l].,....W|
 -00000060  18 1d d2 5e                                       |...^|
-+00000000  14 03 03 00 01 01 16 03  03 00 20 b1 ab c5 7d 20  |.......... ...} |
-+00000010  bd 9b ae 8e 9d cc 0b e5  3e 28 69 53 d2 cb 3b f2  |........>(iS..;.|
-+00000020  73 6d 2a 86 24 72 58 60  e5 95 36 17 03 03 00 1d  |sm*.$rX`..6.....|
-+00000030  af 90 36 98 b7 b5 73 1a  9c ba 61 97 16 25 91 01  |..6...s...a..%..|
-+00000040  aa 05 f3 66 33 d3 0d c5  1a b4 ff d4 3e 15 03 03  |...f3.......>...|
-+00000050  00 12 e5 9d 6c db 8c 66  28 a2 fd e4 f5 a2 cd c0  |....l..f(.......|
-+00000060  df 6f 6d 77                                       |.omw|
++00000000  14 03 03 00 01 01 16 03  03 00 20 d6 62 19 c7 fd  |.......... .b...|
++00000010  bc a1 c5 eb cf 4e e5 07  e9 9a 5e a1 e6 10 38 e9  |.....N....^...8.|
++00000020  13 25 fa b5 e5 20 85 90  e3 3f 2a 17 03 03 00 1d  |.%... ...?*.....|
++00000030  82 fd db 91 c8 4b 95 26  69 8c 72 b1 69 ea 57 b4  |.....K.&i.r.i.W.|
++00000040  01 55 8b 0d 95 f0 0e aa  a0 69 3d e8 69 15 03 03  |.U.......i=.i...|
++00000050  00 12 84 c4 2a 61 1c df  aa 1f 02 2a c6 24 98 ee  |....*a.....*.$..|
++00000060  1e a2 31 af                                       |..1.|
 diff --git a/src/crypto/tls/tls_test.go b/src/crypto/tls/tls_test.go
 --- a/src/crypto/tls/tls_test.go
 +++ b/src/crypto/tls/tls_test.go
@@ -828,3 +896,17 @@ diff --git a/src/crypto/tls/tls_test.go b/src/crypto/tls/tls_test.go
  
  	// If RSA-PSS is selected, the handshake should fail.
  	if _, _, err := testHandshake(t, clientConfig, serverConfig); err == nil {
+diff --git a/src/crypto/tls/unsupported_key_test.go b/src/crypto/tls/unsupported_key_test.go
+--- a/src/crypto/tls/unsupported_key_test.go
++++ b/src/crypto/tls/unsupported_key_test.go
+@@ -538,7 +538,9 @@ func TestVerifyUnsupportedSignatureCertificateVerifyScheme(t *testing.T) {
+ 	}{
+ 		{"ECDSA scheme", 0, "", true},
+ 		{"not advertised", notAdvertised, "invalid signature algorithm", false},
+-		{"RSA scheme", PKCS1WithSHA256, "unsupported signature scheme", true},
++		// An advertised scheme of another key type. On an ECDHE_ECDSA
++		// suite, the server offers no RSA schemes (gemSpec_Krypt A_22454).
++		{"Ed25519 scheme", Ed25519, "unsupported signature scheme", true},
+ 	} {
+ 		t.Run(tt.name, func(t *testing.T) {
+ 			var hookRuns int

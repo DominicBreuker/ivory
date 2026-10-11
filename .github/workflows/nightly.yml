@@ -1,5 +1,9 @@
 name: nightly
 
+# The long checks. Scheduled runs do their work only in a public
+# repository, where runner minutes are free; elsewhere, start the
+# workflow by hand (Actions → nightly → Run workflow).
+
 on:
   schedule:
     - cron: '17 3 * * *'
@@ -8,8 +12,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   bogo:
+    if: github.event_name != 'schedule' || !github.event.repository.private
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -22,6 +31,7 @@ jobs:
         run: ivory-overlay bogo -profile ${{ matrix.profile }}
 
   x509-long:
+    if: github.event_name != 'schedule' || !github.event.repository.private
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -38,6 +48,7 @@ jobs:
   # and crypto/tls tests there. A failure means the development branch
   # changed in a way the patches or the rewrites don't follow yet.
   tipcheck:
+    if: github.event_name != 'schedule' || !github.event.repository.private
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,6 +65,7 @@ jobs:
   # scripts/fetch-production-tsl.sh after checking its fingerprint), a
   # format ivory doesn't read, or an outage.
   production-tsl:
+    if: github.event_name != 'schedule' || !github.event.repository.private
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

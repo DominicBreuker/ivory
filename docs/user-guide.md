@@ -2,10 +2,11 @@
 
 This guide shows how to build Go programs with ivory: get the patched
 toolchain, use it from your own module, write TLS 1.2 and TLS 1.3 code
-with Brainpool keys and groups, set up editors and CI, and move to a new
-Go release. [security.md](security.md) covers what ivory does and doesn't
-guarantee; [compliance.md](compliance.md) maps TI requirements to code
-and tests.
+with Brainpool keys and groups, check certificates against the TSL, try
+peers with the `ivory` test tool, set up editors and CI, and move to a
+new Go release. [security.md](security.md) covers what ivory does and
+doesn't guarantee; [compliance.md](compliance.md) maps TI requirements
+to code and tests.
 
 > ivory has had a self-review, not an external security review, and
 > hasn't been tested against real TI products yet. Read
@@ -20,10 +21,11 @@ and tests.
 5. [TLS 1.2 for the TI](#5-tls-12-for-the-ti)
 6. [TLS 1.3 with Brainpool](#6-tls-13-with-brainpool)
 7. [TSL and OCSP](#7-tsl-and-ocsp)
-8. [Editors](#8-editors)
-9. [CI](#9-ci)
-10. [New Go releases](#10-new-go-releases)
-11. [Troubleshooting](#11-troubleshooting)
+8. [The ivory test tool](#8-the-ivory-test-tool)
+9. [Editors](#9-editors)
+10. [CI](#10-ci)
+11. [New Go releases](#11-new-go-releases)
+12. [Troubleshooting](#12-troubleshooting)
 
 ## 1. What you need
 
@@ -96,7 +98,7 @@ go build ./...
 |---|---|---|
 | Disk | the patched files only (22 for `core`, 29 for `kt`) | a full Go installation (about 250 MB) |
 | Needs `-overlay` in every go command | yes (`GOFLAGS` does it) | no |
-| gopls and other tools that read source themselves | **no**: they see the pristine files (Section 7) | yes |
+| gopls and other tools that read source themselves | **no**: they see the pristine files (Section 9) | yes |
 | Docker images, BoGo | possible | simpler |
 
 Rules for both:
@@ -140,6 +142,8 @@ Packages:
 | `x509util` | parse Brainpool keys; check certificate, CSR and CRL signatures by Brainpool keys | no (Brainpool certificates themselves parse only with the overlay, P1) |
 | `tlsutil` | Brainpool groups, signature verification and signers for `crypto/tls` | yes |
 | `ti` | `tls.Config` presets and certificate checks for TI roles | yes (except `Verifier` and the session helpers) |
+| `tsl` | the TI's TSL: schema, XML signature, trust space update, CA status (Section 7) | no (Brainpool certificates in the TSL parse only with the overlay) |
+| `ocsp` | OCSP requests and responses with Brainpool, NIST and RSA responders (Section 7) | no (likewise) |
 
 ## 5. TLS 1.2 for the TI
 
@@ -413,7 +417,42 @@ tests)
 - Without the overlay, the packages compile but skip Brainpool
   certificates as unparsable: build with it.
 
-## 8. Editors
+## 8. The ivory test tool
+
+[`cmd/ivory`](../cmd/ivory/README.md) is a command-line tool built on
+these packages, for trying Brainpool TLS against TI products and test
+tools before (or while) you write code. **It is experimental**: it has
+not been used against Konnektoren or card terminals inside the TI yet,
+and its flags and reports may change.
+
+| Command | Use it to |
+|---|---|
+| `ivory client` | connect once and see what was negotiated, the peer's chain read the TI way, and its check against the TSL with OCSP |
+| `ivory server` | see what a client (a Konnektor, a test tool, your own program) offers and presents |
+| `ivory probe` | find out which versions, cipher suites, groups and signature schemes a server supports |
+| `ivory tunnel`, `ivory proxy` | give curl or a program in another language Brainpool TLS to a server |
+| `ivory reverse` | give a server without Brainpool support a Brainpool TLS front end |
+
+Build it in the ivory checkout, with the overlay of Section 2:
+
+```sh
+eval "$(scripts/ivory-overlay env -profile core)"
+go build -o ivory ./cmd/ivory
+./ivory probe -env tu host:443       # a server of the TI test environment
+```
+
+Build it with `-profile kt` to behave like a card terminal (server) or
+a Konnektor (client). `-env tu`, `-env ru` and `-env pu` check peers
+against the TSL of the test, reference or production environment;
+connections to production products need `-allow-pu` and the operator's
+permission. Every command that connects out takes `-proxy` (HTTP
+`CONNECT`, or SOCKS5 such as an `ssh -D` tunnel). The tool's
+[README](../cmd/ivory/README.md#first-steps) starts with a local
+walk-through that needs nothing but the test PKI in `testdata/pki/`;
+[security.md](security.md#8-the-ivory-test-tool) says what the tool
+trusts and what to watch out for.
+
+## 9. Editors
 
 Use a **materialized GOROOT** for editors. gopls doesn't apply a
 `GOFLAGS` overlay: it reads the source files itself, so it sees the
@@ -449,7 +488,7 @@ Other editors: set GOROOT and the build tags the same way, or start the
 editor from a shell after `eval "$(scripts/ivory-overlay env -profile
 core -materialized)"`.
 
-## 9. CI
+## 10. CI
 
 The same commands work in CI; ivory's own CI runs them. A GitHub Actions
 job for your module (replace `vX.Y.Z` by the ivory version in your
@@ -485,7 +524,7 @@ jobs:
 - Cache `~/.cache/ivory/<version>` (the toolchain, about 250 MB) with
   `actions/cache`, keyed by the version in `overlay/GOVERSION`.
 
-## 10. New Go releases
+## 11. New Go releases
 
 ivory pins one Go release; README.md lists it. When Go publishes a patch
 release, ivory adopts it with one command, run in a clean checkout of
@@ -505,11 +544,11 @@ whose context changed fails with the rejected hunks; it needs a rebase
 by hand. Going from go1.27.1 to go1.27.2 took 3 minutes 16 seconds,
 download included.
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
-| `unknown field KeyExchanges in struct literal` or `undefined: tls.KeyExchange` | no overlay: `eval "$(scripts/ivory-overlay env …)"`, or a materialized GOROOT. In an editor, see Section 7. |
+| `unknown field KeyExchanges in struct literal` or `undefined: tls.KeyExchange` | no overlay: `eval "$(scripts/ivory-overlay env …)"`, or a materialized GOROOT. In an editor, see Section 9. |
 | `build constraints exclude all Go files` | the `ivory` build tag is missing from `GOFLAGS` |
 | `go: downloading go1.27.x` | `GOTOOLCHAIN` is not `local`; the downloaded Go can't be patched |
 | `… does not match its pin` | the toolchain in `~/.cache/ivory` was changed; delete it and run `toolchain` again |

@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -170,12 +171,20 @@ func sortedKeys(m map[string]bool) []string {
 	return keys
 }
 
-// pristineFiles returns the files the patches expect in GOROOT, sorted.
+// pristineFiles returns the files the patches expect in GOROOT, sorted: the
+// files they change, except those an earlier patch in ps adds.
 func pristineFiles(ps []*patch) []string {
-	set := map[string]bool{}
+	set, added := map[string]bool{}, map[string]bool{}
 	for _, p := range ps {
 		for _, f := range p.old {
-			set[f] = true
+			if !added[f] {
+				set[f] = true
+			}
+		}
+		for _, f := range p.new {
+			if !slices.Contains(p.old, f) {
+				added[f] = true
+			}
 		}
 	}
 	return sortedKeys(set)

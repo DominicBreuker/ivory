@@ -199,16 +199,32 @@ specific to eHealth card terminals and stay in the overlay.
 - **Change** (`handshake_server.go`, `doFullHandshake`): a TLS 1.2 server
   sends `certificate_types = [ecdsa_sign]` on ECDHE_ECDSA suites and
   `[rsa_sign]` on RSA suites, instead of both. A Go client then sends the
-  certificate that matches the suite.
+  certificate that matches the suite. `supported_signature_algorithms`
+  lists only the algorithms of that type: ECDSA and Ed25519 (RFC 8422,
+  Section 5.5) with `ecdsa_sign`, RSA-PSS and PKCS #1 v1.5 with
+  `rsa_sign`. RFC 5246 doesn't require the two lists to agree, but strict
+  clients (tlslite-ng, so tlsfuzzer) reject a CertificateRequest whose
+  algorithms need a type it doesn't list. A client that ignores
+  `certificate_types` can't sign with the other key type either: the
+  server refuses a CertificateVerify whose algorithm it didn't offer.
 - **Tests:** `certificate_types_test.go` records the CertificateRequest
-  on both suites and checks which of two client certificates is sent; it
-  fails without the change. The TLS 1.2 `TestClientAuth` recordings were
-  regenerated with OpenSSL 1.1.1w (`handshake_test.go` asks for 1.1.1);
-  its RSA client certificate cases and `TestPKCS1OnlyCert` now use a
-  server with an RSA certificate. Tests read testdata from disk, not
-  through the overlay, so `stdtest` tests the kt profile in a
-  materialized GOROOT. Full BoGo passes.
-- **Probe:** K3 (`40` on ECDHE_ECDSA, `01` on ECDHE_RSA).
+  on both suites, checks both lists and which of two client certificates
+  is sent; it fails without the change. The TLS 1.2 `TestClientAuth`
+  recordings were regenerated with OpenSSL 1.1.1w (`handshake_test.go`
+  asks for 1.1.1); its RSA client certificate cases and
+  `TestPKCS1OnlyCert` now use a server with an RSA certificate. P2's
+  `TestVerifyUnsupportedSignatureCertificateVerifyScheme` names Ed25519
+  instead of an RSA scheme as the advertised scheme of another key type,
+  since the server offers no RSA scheme on its ECDSA suite (the patch
+  changes a file that P2 adds; `ivory-overlay pin` pins only files of the
+  pristine release). Tests read testdata from disk, not through the
+  overlay, so `stdtest` tests the kt profile in a materialized GOROOT.
+  Full BoGo passes with five tests disabled in `bogo_config.json`
+  (`TLS12-Server-ClientAuth-ECDSA`, `Server-Verify-*-TLS12` for ECDSA
+  and Ed25519): their client signs with an ECDSA or Ed25519 key towards
+  a server with an RSA certificate, which the narrowed list rules out.
+- **Probe:** K3 (`40` on ECDHE_ECDSA, `01` on ECDHE_RSA). Interop: I10
+  (both lists, seen by OpenSSL), F6 (tlsfuzzer's consistency check).
 
 ### P7: ECDSA suites first (kt)
 

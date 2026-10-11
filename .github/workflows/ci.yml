@@ -1,12 +1,25 @@
 name: ci
 
+# Runs on every push to main and on demand (Actions → ci → Run workflow).
+# Pull requests and other branches get no automatic run: check them
+# locally before merging. Pushes that change only Markdown or docs/ are
+# skipped. The Windows SChannel jobs run on demand only.
+
 on:
   push:
-  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# A newer push to the same branch cancels the run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
@@ -156,7 +169,9 @@ jobs:
   # Windows SChannel through .NET's SslStream (S1-S7,
   # interop/testdata/schannel): the Go peer is cross-compiled here with
   # the overlay, the Windows job runs it.
+  # On demand only: Windows runners cost more than Linux ones.
   schannel-peer:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false

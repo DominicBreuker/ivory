@@ -284,15 +284,8 @@ func TestF3ECDSASignatureFlexibility(t *testing.T) {
 // with illegal_parameter, since the server never offers them
 // (A_21275-01); tlsfuzzer expects them to work or to fail with
 // decrypt_error.
-//
-// Profile kt asks only for ecdsa_sign on ECDSA suites but keeps the RSA
-// schemes (F6), which tlsfuzzer rejects in every probe; F4 runs with
-// profile core only.
 func TestF4TLS12CertificateVerify(t *testing.T) {
 	needTLSFuzzer(t)
-	if ktProfile {
-		t.Skip("profile kt: every probe fails tlsfuzzer's CertificateRequest check (F6)")
-	}
 	var args []string
 	for _, h := range []string{"sha512", "sha384", "sha256", "sha224", "sha1"} {
 		for _, adv := range []string{"sha224", "sha1"} {
@@ -344,23 +337,25 @@ const tls12CertRequestSchemes = "rsa_pss_rsae_sha256 ecdsa_secp256r1_sha256 ed25
 	"rsa_pss_rsae_sha384 rsa_pss_rsae_sha512 rsa_pkcs1_sha256 rsa_pkcs1_sha384 rsa_pkcs1_sha512 " +
 	"ecdsa_secp384r1_sha384 ecdsa_secp521r1_sha512"
 
+// tls12CertRequestSchemesECDSA are those of profile kt's CertificateRequest
+// on an ECDSA suite: only the schemes of ecdsa_sign, Ed25519 included
+// (RFC 8422, Section 5.5).
+const tls12CertRequestSchemesECDSA = "ecdsa_secp256r1_sha256 ed25519 ecdsa_secp384r1_sha384 ecdsa_secp521r1_sha512"
+
 // F6: the CertificateRequest of the KT server (ti.KTServer) on an ECDSA
 // suite, with a Konnektor-like Brainpool client certificate. Profile
-// core asks for rsa_sign and ecdsa_sign. Profile kt asks only for
-// ecdsa_sign, the type of the suite (A_22454), but keeps the RSA schemes
-// in supported_signature_algorithms; tlsfuzzer rejects that combination
-// in every probe, RFC 5246 doesn't forbid it.
+// core asks for rsa_sign and ecdsa_sign with all of crypto/tls's schemes.
+// Profile kt asks only for ecdsa_sign, the type of the suite (A_22454),
+// and lists only its schemes, so that tlsfuzzer's consistency check
+// passes.
 func TestF6KTCertificateRequest(t *testing.T) {
 	needTLSFuzzer(t)
 	port, _ := fuzzServer(t, ktConfig(t))
-	args := []string{"-d", "-C", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-		"-k", absPKI(t, "bp256-client.sec1.pem"), "-c", absPKI(t, "bp256-client.pem"),
-		"-s", tls12CertRequestSchemes, "-T", "rsa_sign ecdsa_sign"}
+	schemes, types := tls12CertRequestSchemes, "rsa_sign ecdsa_sign"
 	if ktProfile {
-		args[len(args)-1] = "ecdsa_sign"
-		for _, probe := range []string{"sanity", "with certificate", "check sigalgs in cert request", "check cert types in cert request"} {
-			args = append(args, xfail(probe, "does not include rsa_sign client certificate type")...)
-		}
+		schemes, types = tls12CertRequestSchemesECDSA, "ecdsa_sign"
 	}
-	runTLSFuzzer(t, port, "test-certificate-request.py", args...)
+	runTLSFuzzer(t, port, "test-certificate-request.py", "-d", "-C", "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+		"-k", absPKI(t, "bp256-client.sec1.pem"), "-c", absPKI(t, "bp256-client.pem"),
+		"-s", schemes, "-T", types)
 }

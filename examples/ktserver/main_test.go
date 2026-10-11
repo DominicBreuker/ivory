@@ -150,11 +150,12 @@ func sClient(t *testing.T, addr string, l *logs, waitLog string, lines []string,
 
 func TestKTServer(t *testing.T) {
 	for _, tt := range []struct {
-		name      string
-		paired    string
-		args      []string
-		wantState string
-		wantOut   []string
+		name        string
+		paired      string
+		args        []string
+		wantState   string
+		wantStateKT string // with profile kt, if it differs
+		wantOut     []string
 	}{
 		{
 			name:      "Brainpool client certificate, ECDSA suites only: ECC identity",
@@ -173,7 +174,11 @@ func TestKTServer(t *testing.T) {
 			name:      "RSA suites only: RSA identity",
 			args:      []string{"-cipher", "ECDHE-RSA-AES128-GCM-SHA256", "-CAfile", pkiFile("rsa-ca.pem"), "-verify_return_error", "-cert", pkiFile("bp256-client.pem"), "-key", pkiFile("bp256-client.key")},
 			wantState: "State_ClientWithoutPairing",
-			wantOut:   []string{"Verification: OK", "KT: ping", "Cipher is ECDHE-RSA-AES128-GCM-SHA256"},
+			// Profile kt offers only RSA signature schemes on RSA suites
+			// (A_22454), so the client can't sign with its Brainpool key
+			// and sends no certificate (A_22890).
+			wantStateKT: "State_InvalidClient (no client certificate)",
+			wantOut:     []string{"Verification: OK", "KT: ping", "Cipher is ECDHE-RSA-AES128-GCM-SHA256"},
 		},
 		{
 			name:      "no Brainpool group offered: RSA identity",
@@ -197,6 +202,9 @@ func TestKTServer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			addr, l := startServer(t, tt.paired)
 			out := sClient(t, addr, l, "", []string{"ping"}, tt.args...)
+			if ktProfile && tt.wantStateKT != "" {
+				tt.wantState = tt.wantStateKT
+			}
 			l.wait(t, tt.wantState)
 			for _, want := range tt.wantOut {
 				if !strings.Contains(out, want) {

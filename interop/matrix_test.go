@@ -193,36 +193,57 @@ func TestI9Renegotiation(t *testing.T) {
 	wantOutput(t, out, "RENEGOTIATING", "fatal no_renegotiation")
 }
 
-// certificateTypes returns the certificate_types of the CertificateRequest
-// in the output of openssl s_client -msg.
-func certificateTypes(t *testing.T, out string) string {
+// certificateRequest returns the certificate_types and the
+// supported_signature_algorithms of the CertificateRequest in the output of
+// openssl s_client -msg, as hex bytes.
+func certificateRequest(t *testing.T, out string) (types, schemes string) {
 	t.Helper()
 	lines := strings.Split(out, "\n")
 	for i, l := range lines {
-		if strings.Contains(l, "<<< TLS 1.2, Handshake") && strings.HasSuffix(strings.TrimSpace(l), "CertificateRequest") && i+1 < len(lines) {
-			b := strings.Fields(lines[i+1]) // 0d, length (3 bytes), count, types...
-			if len(b) < 5 {
+		if !strings.Contains(l, "<<< TLS 1.2, Handshake") || !strings.HasSuffix(strings.TrimSpace(l), "CertificateRequest") {
+			continue
+		}
+		var b []string // 0d, length (3 bytes), count, types, length (2 bytes), schemes, ...
+		for _, l := range lines[i+1:] {
+			if !strings.HasPrefix(l, " ") {
 				break
 			}
-			n, err := strconv.ParseUint(b[4], 16, 8)
-			if err == nil && 5+int(n) <= len(b) {
-				return strings.Join(b[5:5+int(n)], " ")
-			}
+			b = append(b, strings.Fields(l)...)
 		}
+		if len(b) < 5 {
+			break
+		}
+		n, err := strconv.ParseUint(b[4], 16, 8)
+		if err != nil || 5+int(n)+2 > len(b) {
+			break
+		}
+		types = strings.Join(b[5:5+int(n)], " ")
+		b = b[5+int(n):]
+		m, err := strconv.ParseUint(b[0]+b[1], 16, 16)
+		if err != nil || 2+int(m) > len(b) {
+			break
+		}
+		return types, strings.Join(b[2:2+int(m)], " ")
 	}
 	t.Fatalf("no CertificateRequest in the output:\n%s", out)
-	return ""
+	return "", ""
 }
 
 // I10: the CertificateRequest of an eHealth-KT has one certificate type,
-// the one that matches the suite (A_22454, P6, profile kt; probe K3).
+// the one that matches the suite (A_22454, P6, profile kt; probe K3), and
+// only the signature schemes of that type.
 func TestI10CertificateTypes(t *testing.T) {
+	const (
+		ecdsaSchemes = "04 03 08 07 05 03 06 03"                                     // ECDSA P-256, Ed25519, ECDSA P-384, P-521
+		rsaSchemes   = "08 04 08 05 08 06 04 01 05 01 06 01"                         // RSA-PSS, PKCS #1 v1.5 with SHA-256, -384, -512
+		allSchemes   = "08 04 04 03 08 07 08 05 08 06 04 01 05 01 06 01 05 03 06 03" // crypto/tls's order
+	)
 	for _, tt := range []struct {
-		name, cipher, ca string
-		wantKT           string
+		name, cipher, ca      string
+		wantKT, wantKTSchemes string
 	}{
-		{"ECDSA suite", "ECDHE-ECDSA-AES128-GCM-SHA256", "bp256-ca", "40"},
-		{"RSA suite", "ECDHE-RSA-AES128-GCM-SHA256", "rsa-ca", "01"},
+		{"ECDSA suite", "ECDHE-ECDSA-AES128-GCM-SHA256", "bp256-ca", "40", ecdsaSchemes},
+		{"RSA suite", "ECDHE-RSA-AES128-GCM-SHA256", "rsa-ca", "01", rsaSchemes},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, out, err := serverWithSClient(t, ktConfig(t), "-tls1_2", "-msg", "-cipher", tt.cipher,
@@ -230,12 +251,16 @@ func TestI10CertificateTypes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := "01 40" // core: rsa_sign, ecdsa_sign
+			want, wantSchemes := "01 40", allSchemes // core: rsa_sign, ecdsa_sign
 			if ktProfile {
-				want = tt.wantKT
+				want, wantSchemes = tt.wantKT, tt.wantKTSchemes
 			}
-			if got := certificateTypes(t, out); got != want {
+			got, gotSchemes := certificateRequest(t, out)
+			if got != want {
 				t.Errorf("certificate_types = %s, want %s", got, want)
+			}
+			if gotSchemes != wantSchemes {
+				t.Errorf("supported_signature_algorithms = %s, want %s", gotSchemes, wantSchemes)
 			}
 		})
 	}
